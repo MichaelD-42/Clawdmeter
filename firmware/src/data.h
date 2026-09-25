@@ -16,6 +16,16 @@ struct UsageData {
                              // has no opinion, device picks by usage rate)
     long clock_epoch;        // local wall-clock epoch (s) from daemon; 0 = not provided
     int  clock_fmt;          // 12 or 24 (hour format from daemon); defaults to 24
+    char user[24];           // account display name ("" = daemon didn't say)
+    char plan[16];           // plan label, e.g. "Max 20x" ("" = unknown)
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
+};
+
+// What Claude Code is doing on the host, from its hooks. Arrives as its own
+// {"ev":1,...} message, separate from the usage payload.
+struct SessionInfo {
+    char project[24];        // basename of the session's working dir
+    char state[8];           // "work", "wait" (needs you), "done", "idle"
+    char tool[20];           // tool in use while working, "" otherwise
 };

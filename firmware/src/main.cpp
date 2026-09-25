@@ -23,6 +23,7 @@
 #include "hal/sound_hal.h"
 
 static UsageData usage = {};
+static SessionInfo session = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -105,13 +106,23 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
+// The daemon sends two kinds of message: the usage payload, and a small
+// {"ev":1,...} one whenever Claude Code's session state changes.
+enum msg_kind_t { MSG_BAD, MSG_USAGE, MSG_SESSION };
+
+static msg_kind_t parse_json(const char* json, UsageData* out, SessionInfo* sess) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
         Serial.printf("JSON parse error: %s\n", err.c_str());
-        return false;
+        return MSG_BAD;
+    }
+
+    if (doc["ev"].is<int>()) {
+        strlcpy(sess->project, doc["p"] | "", sizeof(sess->project));
+        strlcpy(sess->state, doc["st"] | "idle", sizeof(sess->state));
+        strlcpy(sess->tool, doc["tl"] | "", sizeof(sess->tool));
+        return MSG_SESSION;
     }
 
     out->session_pct = doc["s"] | 0.0f;
@@ -128,9 +139,11 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->anim, doc["a"] | "", sizeof(out->anim));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+    strlcpy(out->user, doc["u"] | "", sizeof(out->user));
+    strlcpy(out->plan, doc["pl"] | "", sizeof(out->plan));
     out->ok = doc["ok"] | false;
     out->valid = true;
-    return true;
+    return MSG_USAGE;
 }
 
 // ---- Serial command buffer ----
@@ -569,7 +582,14 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
+        msg_kind_t kind = parse_json(ble_get_data(), &usage, &session);
+        if (kind == MSG_SESSION) {
+            // Claude is stuck on a question: light the panel up so the alert
+            // is seen, not just drawn on a dark screen.
+            if (strcmp(session.state, "wait") == 0) idle_note_activity();
+            ui_update_session(&session);
+            ble_send_ack();
+        } else if (kind == MSG_USAGE) {
             int g_before = usage_rate_group();
             bool session_reset = usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();

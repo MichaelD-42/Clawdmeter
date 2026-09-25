@@ -43,10 +43,17 @@ enum pair_ui_t {
 // cheap: they only feed the timer.
 void ui_set_pair_state(pair_ui_t state);
 
-// True while the pairing overlay owns pixels. The splash paints straight to
-// the panel on PSRAM-less boards and checks this before its own redraws, the
-// same way it consults charge_anim_is_active().
+// True while an overlay owns pixels — a pairing gesture or the needs-input
+// ring. The splash paints straight to the panel on PSRAM-less boards and
+// checks this before its own redraws, the same way it consults
+// charge_anim_is_active().
 bool ui_pair_overlay_active(void);
+
+// Claude Code's session state, from its hooks via the daemon. Replaces the
+// whimsical status line with what the session is doing; "wait" (a permission
+// prompt or question) blinks a ring around the panel edge over whichever
+// screen is showing, until the state moves on or a tap dismisses it.
+void ui_update_session(const SessionInfo* s);
 
 // What the touch gestures do on boards with BoardCaps.touch_keys (main.cpp
 // supplies the key actions). Ignored elsewhere — there every touch is a tap.

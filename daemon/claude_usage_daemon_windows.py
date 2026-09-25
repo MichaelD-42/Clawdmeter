@@ -26,13 +26,18 @@ from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
+try:  # imported as daemon.claude_usage_daemon_windows (tray, tests)
+    from daemon import clawdmeter_info
+except ImportError:  # run directly as a script
+    import clawdmeter_info
+
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
-TICK = 5
+TICK = 1  # fast enough for the "needs input" alert; the API poll stays at 60s
 CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
 CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
 ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning a half-open link
@@ -260,6 +265,8 @@ async def poll_api(token: str) -> dict | None:
         }
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
+    # "u" + "pl": account name and plan, from Claude Code's own account file.
+    payload.update(clawdmeter_info.account_fields(os.environ.get("CLAUDE_CONFIG_DIR")))
     return payload
 
 
@@ -422,6 +429,11 @@ class Session:
             # silent-freeze failure mode, SC#2 field report).
             log(f"Write failed: {e}")
             return False
+
+    async def write_event(self, msg: dict) -> bool:
+        """Session-state message. Kept apart from write_payload so a failed one
+        doesn't count toward the zombie-link break — the usage write owns that."""
+        return await self.write_payload(msg)
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -605,6 +617,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     last_poll = 0.0  # D-03: poll immediately on first connect
     used_successfully = False
     consecutive_failures = 0  # D-03: zombie-link break counter
+    last_session = None  # session message the board last got; None = nothing yet
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
@@ -644,6 +657,12 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                     # toast "token expired" — that mislabeled a boot-time DNS blip
                     # as an auth problem (SC#5). Leave tray state unchanged; the next
                     # tick retries and set_connected() recovers it.
+
+            # What Claude Code is doing, from the hooks (clawdmeter_info.py hook).
+            # Sent only when it changes, so a tick costs a few file reads.
+            msg = clawdmeter_info.session_summary()
+            if msg != last_session and await session.write_event(msg):
+                last_session = msg
 
             # Wake on a refresh request OR a stop, whichever comes first. Waking
             # promptly on stop_event is what lets the finally below run

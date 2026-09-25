@@ -242,6 +242,27 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
 7. The two side buttons are independent of all of this — they send Space and Shift+Tab as BLE HID keyboard input to the paired host directly.
 
+## Session state and the needs-input alert
+
+The status line under the rings can show what Claude Code is doing ("Bash…", "Done", "Needs input") instead of the whimsical words. When Claude stops on a permission prompt or a question, the board wakes and a ring blinks around the edge of the panel, over whatever screen is up. It stops once the tool runs, or when you tap the screen.
+
+This comes from Claude Code hooks. Each hook call hands its event to `daemon/clawdmeter_info.py`, which keeps one small file per session under `~/.cache/clawdmeter/sessions/`, and the daemon forwards any change within a second. Add this to `~/.claude/settings.json` on each machine, with the path pointing at your checkout (on Windows: `python %USERPROFILE%\Clawdmeter\daemon\clawdmeter_info.py hook`, with each backslash doubled inside the JSON):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }]
+  }
+}
+```
+
+The hook always exits 0 with no output, so it never blocks or changes anything Claude does. With several sessions open, a session that is waiting on you wins; otherwise the most recently active one is shown. Without the hooks the status line just reads "Idle"; only an older daemon leaves the old status words up.
+
 ## Physical buttons
 
 The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.
@@ -271,7 +292,15 @@ JSON payload format (written to RX):
 { "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true }
 ```
 
-Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag. Optional: `u` = account display name and `pl` = plan ("Pro", "Max 20x", …), read from Claude Code's `.claude.json`; the round Knob layout shows them under the status line.
+
+Session-state messages are written to the same characteristic, whenever the state changes:
+
+```json
+{ "ev": 1, "p": "Clawdmeter", "st": "work", "tl": "Bash" }
+```
+
+`p` = project (working-directory name), `st` = `work` / `wait` (needs input) / `done` / `idle`, `tl` = tool in use.
 
 ## Recompiling fonts
 

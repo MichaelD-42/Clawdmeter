@@ -49,6 +49,7 @@ struct Layout {
     const lv_font_t* pace_font;      // enterprise "Under/On/Over pace" line
     const lv_font_t* anim_font;      // animated status line
     int16_t anim_y;                  // status line offset from bottom
+    int16_t account_y;               // account line ("Name · Plan") offset from bottom; 0 = not shown
     bool    show_logo;               // corner logo; off on round panels, where no corner is visible
     bool    small_icons;             // 40px logo + 24px battery (vs 80/48) on small screens
     int16_t title_nudge;             // title x-shift balancing the corner logo
@@ -68,8 +69,7 @@ struct Layout {
     int16_t ring_label_r;            // radius of the quarter-mark labels, inside the rings
     const lv_font_t* ring_label_font;
 
-    // Gauge colours: track, and fill (bars: below the 50 / 80 % warning
-    // levels; rings: always)
+    // Gauge colours: track, and fill below the 50 / 80 % warning levels
     lv_color_t gauge_track;
     lv_color_t gauge_ok;
     const lv_font_t* week_pct_font;  // weekly number, one step below the session number
@@ -116,6 +116,7 @@ static void compute_layout(const BoardCaps& c) {
     L.pace_font    = &font_styrene_16;
     L.anim_font    = &font_mono_32;
     L.anim_y = -15;
+    L.account_y = 0;
     L.show_logo = true;
     L.round = false;
     L.gauge_track = THEME_BAR_BG;
@@ -219,10 +220,9 @@ static void compute_layout(const BoardCaps& c) {
         L.ring_tick_w = 3;
         L.ring_label_r = 128;
         L.ring_label_font = &font_styrene_12;
-        // Always-orange fill (set_gauge doesn't recolour rings) on a lighter
-        // track, so the unfilled part of the scale is visible too.
+        // Lighter track, so the unfilled part of the scale is visible too.
+        // Fill goes green / amber / red like the bars.
         L.gauge_track = THEME_RING_BG;
-        L.gauge_ok    = THEME_ACCENT;
         L.title_font   = &font_tiempos_34;
         L.title_y = 62;
         L.title_nudge = 0;
@@ -233,7 +233,9 @@ static void compute_layout(const BoardCaps& c) {
         L.reset_font    = &font_styrene_16;
         L.pace_font     = &font_styrene_14;
         L.anim_font     = &font_mono_18;
-        L.anim_y = -36;
+        L.anim_y = -40;
+        // Under the status line, in what is left of the ring gap.
+        L.account_y = -16;
         L.r_s_label_y = -60;
         L.r_s_pct_y   = -26;
         L.r_s_reset_y = 12;
@@ -293,7 +295,15 @@ static lv_obj_t* panel_weekly = nullptr;
 static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
-static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
+static lv_obj_t* lbl_anim;      // status line: connection state + session state
+static lv_obj_t* lbl_account;   // "Name · Plan", round layout only
+
+// Claude Code session state (ui_update_session). Until the first one arrives
+// — an older daemon, or no hooks installed — the whimsical words stay.
+static SessionInfo sess = {};
+static bool        sess_known = false;
+static bool        alert_on = false;         // needs-input ring blinking
+static bool        alert_dismissed = false;  // tapped away; stays away until the state moves on
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -409,9 +419,13 @@ static bool               holding = false;
 
 void ui_set_touch_keys(const UiTouchKeys* keys) { touch_keys = keys; }
 
+static bool alert_tap_dismiss(void);
+static void build_alert_ring(lv_obj_t* parent);
+
 static void tap_timer_cb(lv_timer_t* t) {
     (void)t;
     tap_timer = nullptr;   // one-shot; LVGL deletes it after this call
+    if (alert_tap_dismiss()) return;
     ui_toggle_splash();
 }
 
@@ -557,12 +571,11 @@ static void add_ring_ticks(lv_obj_t* parent) {
 }
 
 // Fill level + colour of a usage gauge — a bar on rectangular panels, a ring
-// on round ones. Rings keep the single fill colour make_ring() gave them
-// (the level is read off the scale marks and the number in the middle), so
-// `color` only applies to bars.
+// on round ones.
 static void set_gauge(lv_obj_t* gauge, int value, lv_color_t color) {
     if (L.round) {
         lv_arc_set_value(gauge, value);
+        lv_obj_set_style_arc_color(gauge, color, LV_PART_INDICATOR);
     } else {
         lv_bar_set_value(gauge, value, LV_ANIM_ON);
         lv_obj_set_style_bg_color(gauge, color, LV_PART_INDICATOR);
@@ -890,6 +903,14 @@ static void init_usage_screen(lv_obj_t* scr) {
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
+    if (L.account_y) {
+        lbl_account = lv_label_create(usage_group);
+        lv_label_set_text(lbl_account, "");
+        lv_obj_set_style_text_font(lbl_account, L.pace_font, 0);
+        lv_obj_set_style_text_color(lbl_account, COL_DIM, 0);
+        lv_obj_align(lbl_account, LV_ALIGN_BOTTOM_MID, 0, L.account_y);
+    }
+
     build_pair_group(usage_container);
     build_idle_group(usage_container);
 
@@ -940,6 +961,7 @@ void ui_init(void) {
     // Above the usage view and the splash, below the charge overlay — the
     // pairing gesture can be started from either screen.
     build_pair_toast(scr);
+    build_alert_ring(scr);
 
     // Last, so the charge overlay covers everything else when it plays.
     charge_anim_init(scr);
@@ -958,6 +980,13 @@ void ui_update(const UsageData* data) {
         clock_base_epoch = 0;
         clock_last_min = -1;
         lv_label_set_text(lbl_title, "Usage");
+    }
+
+    if (lbl_account) {
+        if (data->user[0] && data->plan[0])
+            lv_label_set_text_fmt(lbl_account, "%s - %s", data->user, data->plan);
+        else
+            lv_label_set_text(lbl_account, data->user[0] ? data->user : data->plan);
     }
 
     int s_pct = (int)(data->session_pct + 0.5f);
@@ -1087,23 +1116,34 @@ void ui_tick_anim(void) {
     anim_spinner_idx = (anim_phase < SPINNER_COUNT) ? anim_phase
                                                     : (SPINNER_PHASES - anim_phase);
 
-    // Status text by priority. Whimsical messages only when connected & settled.
+    // Status text by priority. Session state once the hooks report; the
+    // whimsical words only while they never have.
     const char* text;
+    const char* tail = "\xE2\x80\xA6";   // "…" reads as "in progress"
+    lv_color_t  color = COL_ACCENT;
     if (!s_ble_connected) {
         text = "Waiting";              // advertising / waiting for a host connection
     } else if (view_state == 1) {      // idle — alternate so it reads as alive AND data-less
         text = (anim_msg_idx & 1) ? "No data" : "Listening";
     } else if (now - connected_at_ms < 5000) {
         text = "Connected";
+    } else if (sess_known && strcmp(sess.state, "work") == 0) {
+        text = sess.tool[0] ? sess.tool : "Working";
+    } else if (sess_known && strcmp(sess.state, "wait") == 0) {
+        text = "Needs input";  tail = "";  color = COL_RED;
+    } else if (sess_known && strcmp(sess.state, "done") == 0) {
+        text = "Done";  tail = "";  color = COL_GREEN;
+    } else if (sess_known) {
+        text = "Idle";  tail = "";  color = COL_DIM;
     } else {
         text = anim_messages[anim_msg_idx];
     }
 
-    // All states share the whimsical style: "<glyph> <Title-case word>…"
+    // "<glyph> <Title-case word>…"
     static char buf[80];
-    snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
-             spinner_frames[anim_spinner_idx], text);
+    snprintf(buf, sizeof(buf), "%s %s%s", spinner_frames[anim_spinner_idx], text, tail);
     lv_label_set_text(lbl_anim, buf);
+    lv_obj_set_style_text_color(lbl_anim, color, 0);
 }
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
@@ -1115,6 +1155,7 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
+    if (alert_tap_dismiss()) return;
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
     else                                  ui_show_screen(SCREEN_SPLASH);
 }
@@ -1199,7 +1240,71 @@ void ui_set_pair_state(pair_ui_t state) {
     lv_timer_resume(pair_toast_timer);
 }
 
-bool ui_pair_overlay_active(void) { return pair_ui_state != PAIR_UI_NONE; }
+bool ui_pair_overlay_active(void) { return pair_ui_state != PAIR_UI_NONE || alert_on; }
+
+// ---- Needs-input alert ----
+// A thick ring around the panel edge that blinks while Claude waits on you.
+// Blinking (show/hide) rather than fading: each step repaints the whole
+// panel, and two steps a second is cheap where a smooth fade is not.
+#define ALERT_BLINK_MS 500
+static lv_obj_t*   alert_ring = nullptr;
+static lv_timer_t* alert_timer = nullptr;
+
+static void alert_blink_cb(lv_timer_t* t) {
+    (void)t;
+    if (lv_obj_has_flag(alert_ring, LV_OBJ_FLAG_HIDDEN)) lv_obj_clear_flag(alert_ring, LV_OBJ_FLAG_HIDDEN);
+    else                                                 lv_obj_add_flag(alert_ring, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_alert_ring(lv_obj_t* parent) {
+    alert_ring = lv_obj_create(parent);
+    lv_obj_set_size(alert_ring, L.scr_w, L.scr_h);
+    lv_obj_set_pos(alert_ring, 0, 0);
+    lv_obj_set_style_bg_opa(alert_ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(alert_ring, COL_ACCENT, 0);
+    lv_obj_set_style_border_width(alert_ring, 10, 0);
+    lv_obj_set_style_radius(alert_ring, L.round ? LV_RADIUS_CIRCLE : L.margin, 0);
+    lv_obj_set_style_pad_all(alert_ring, 0, 0);
+    lv_obj_clear_flag(alert_ring, LV_OBJ_FLAG_SCROLLABLE);
+    // Touch goes through to the screen underneath, which handles the
+    // dismissing tap (alert_tap_dismiss).
+    lv_obj_clear_flag(alert_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(alert_ring, LV_OBJ_FLAG_HIDDEN);
+
+    alert_timer = lv_timer_create(alert_blink_cb, ALERT_BLINK_MS, nullptr);
+    lv_timer_pause(alert_timer);
+}
+
+static void set_alert(bool on) {
+    if (!alert_ring || on == alert_on) return;
+    alert_on = on;
+    if (on) {
+        lv_obj_clear_flag(alert_ring, LV_OBJ_FLAG_HIDDEN);
+        lv_timer_reset(alert_timer);
+        lv_timer_resume(alert_timer);
+    } else {
+        lv_timer_pause(alert_timer);
+        lv_obj_add_flag(alert_ring, LV_OBJ_FLAG_HIDDEN);
+        splash_request_full_redraw();   // the direct-draw splash froze under it
+    }
+}
+
+// A tap while the alert is up acknowledges it instead of switching screens.
+static bool alert_tap_dismiss(void) {
+    if (!alert_on) return false;
+    alert_dismissed = true;
+    set_alert(false);
+    return true;
+}
+
+void ui_update_session(const SessionInfo* s) {
+    const bool wait = strcmp(s->state, "wait") == 0;
+    const bool project_changed = strcmp(s->project, sess.project) != 0;
+    sess = *s;
+    sess_known = true;
+    if (!wait || project_changed) alert_dismissed = false;   // a new question asks again
+    set_alert(wait && !alert_dismissed);
+}
 
 void ui_set_pairing_rejected(bool rejected) {
     if (!pair_l1 || rejected == pair_rejected) return;

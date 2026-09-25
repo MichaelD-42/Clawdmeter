@@ -10,12 +10,15 @@ SERVICE_UUID="4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID="4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL=60
-TICK=5
+TICK=1          # fast enough for the "needs input" alert; the API poll stays at 60s
 SAVED_MAC_FILE="$HOME/.config/claude-usage-monitor/ble-address"
 CONFIG_FILE="$HOME/.config/claude-usage-monitor/config"
 REFRESH_FLAG="/tmp/claude-usage-refresh-$$"
 DBUS_DEST="org.bluez"
 NOTIFY_PID=""
+# Account label + Claude Code session state (see clawdmeter_info.py).
+INFO_PY="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/clawdmeter_info.py"
+SESSION_DIR="$HOME/.cache/clawdmeter/sessions"
 
 log() {
     echo "[$(date '+%H:%M:%S')] $1"
@@ -408,6 +411,9 @@ poll() {
         fi
         payload=$(build_payload_for_token "$token") || { log "API call failed for $dir"; continue; }
         [ -z "$payload" ] && continue
+        # Name + plan go in before the closing brace. Spliced here rather than
+        # through awk -v, which would mangle the \u escapes of a non-ASCII name.
+        payload="${payload%\}}$(python3 "$INFO_PY" account "$dir" 2>/dev/null)}"
         s=$(_payload_session_pct "$payload"); s=${s:-0}
         cycle_payload["$dir"]="$payload"
         cycle_s["$dir"]="$s"
@@ -440,6 +446,22 @@ poll() {
     log "Sending: ${cycle_payload[$best_dir]}"
     write_gatt "$RX_CHAR_PATH" "${cycle_payload[$best_dir]}" || { log "Write failed"; return 1; }
     return 0
+}
+
+# Send the session line when it changed. Called every tick, but only asks
+# python when the sessions dir changed (the hook renames a file into it on
+# every event) — plus once per API poll, which is what ages out stale sessions.
+LAST_SESSION_STAMP=""
+LAST_SESSION_MSG=""
+send_session_if_changed() {
+    local force="$1" stamp msg
+    stamp=$(stat -c %y "$SESSION_DIR" 2>/dev/null)
+    [ -z "$force" ] && [ "$stamp" = "$LAST_SESSION_STAMP" ] && return 0
+    LAST_SESSION_STAMP="$stamp"
+    msg=$(python3 "$INFO_PY" session 2>/dev/null) || return 0
+    [ -z "$msg" ] || [ "$msg" = "$LAST_SESSION_MSG" ] && return 0
+    log "Session: $msg"
+    write_gatt "$RX_CHAR_PATH" "$msg" && LAST_SESSION_MSG="$msg"
 }
 
 cleanup() {
@@ -491,9 +513,11 @@ while true; do
 
     start_notify_subscriber
 
-    # Poll loop: tick every $TICK seconds. Poll Anthropic when the
+    # Poll loop: tick every $TICK seconds. Forward session changes each tick;
+    # poll Anthropic when the
     # interval has elapsed OR when the ESP requested a refresh.
     LAST_POLL=0
+    LAST_SESSION_MSG=""   # a (re)connected board knows nothing yet
     while is_connected; do
         NOW=$(date +%s)
         if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
@@ -502,6 +526,9 @@ while true; do
                 rm -f "$REFRESH_FLAG"
             fi
             poll && LAST_POLL=$NOW
+            send_session_if_changed force
+        else
+            send_session_if_changed
         fi
         sleep "$TICK"
     done
