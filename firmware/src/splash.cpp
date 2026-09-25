@@ -71,6 +71,15 @@ static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
 static int  forced_idx = -1;
 static char forced_req[24] = "";
 
+// What Claude is doing (see splash_set_mood). Below the host override, above
+// the usage-rate groups. `manual_hold` keeps a PWR/tap pick on screen until
+// the mood changes instead of rotating it away after 20 s.
+#define MOOD_MAX 4
+static int8_t  mood_idx[MOOD_MAX];
+static uint8_t mood_n   = 0;
+static uint8_t mood_rot = 0;
+static bool    manual_hold = false;
+
 static void resolve_group_lists(void) {
     for (int g = 0; g < GROUP_COUNT; g++) {
         group_size[g] = 0;
@@ -393,7 +402,8 @@ void splash_tick(void) {
     // Auto-rotate to the next animation in the current group. Suspended while
     // the host drives the animation — otherwise its choice would be dropped
     // after SPLASH_ROTATE_INTERVAL_MS.
-    if (forced_idx < 0 && millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
+    if (forced_idx < 0 && !manual_hold
+        && millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
         splash_pick_for_current_rate();
     }
 
@@ -410,6 +420,7 @@ void splash_tick(void) {
 
 void splash_next(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
+    manual_hold = mood_n > 0;
     cur_anim = (cur_anim + 1) % SPLASH_ANIM_COUNT;
     cur_frame = 0;
     frame_started_ms = millis();
@@ -427,12 +438,6 @@ static void show_anim(int idx) {
     last_pick_ms = frame_started_ms;
     const splash_anim_def_t *a = &splash_anims[cur_anim];
     render_frame(a->frames[0], a->palette);
-}
-
-void splash_prev(void) {
-    if (SPLASH_ANIM_COUNT == 0) return;
-    show_anim((cur_anim + SPLASH_ANIM_COUNT - 1) % SPLASH_ANIM_COUNT);
-    Serial.printf("splash: <- %s\n", splash_anims[cur_anim].name);
 }
 
 void splash_set_anim(const char *name) {
@@ -461,9 +466,29 @@ void splash_set_anim(const char *name) {
     Serial.printf("splash: host asked for unknown anim '%s', ignoring\n", name);
 }
 
+void splash_set_mood(const char* const* names, int n) {
+    int8_t  idx[MOOD_MAX];
+    uint8_t cnt = 0;
+    for (int k = 0; k < n && cnt < MOOD_MAX; k++) {
+        int i = 0;
+        while (i < SPLASH_ANIM_COUNT && strcmp(splash_anims[i].name, names[k]) != 0) i++;
+        if (i < SPLASH_ANIM_COUNT) idx[cnt++] = (int8_t)i;
+        else Serial.printf("splash: mood anim '%s' not in catalog, skipped\n", names[k]);
+    }
+    if (cnt == mood_n && memcmp(idx, mood_idx, cnt) == 0) return;   // unchanged
+
+    memcpy(mood_idx, idx, cnt);
+    mood_n = cnt;
+    mood_rot = 0;
+    manual_hold = false;
+    if (active) splash_pick_for_current_rate();
+}
+
 void splash_pick_for_current_rate(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
     if (forced_idx >= 0) { show_anim(forced_idx); return; }
+    if (manual_hold)     { show_anim(cur_anim); return; }
+    if (mood_n > 0)      { show_anim(mood_idx[mood_rot++ % mood_n]); return; }
     int g = usage_rate_group();
     if (g < 0 || g >= GROUP_COUNT) g = 0;
     if (group_size[g] == 0) return;

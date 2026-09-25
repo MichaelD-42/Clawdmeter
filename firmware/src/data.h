@@ -24,8 +24,34 @@ struct UsageData {
 
 // What Claude Code is doing on the host, from its hooks. Arrives as its own
 // {"ev":1,...} message, separate from the usage payload.
+#define SESSION_ROWS_MAX 4
+#define AGENT_ROWS_MAX   8
+
+struct SessionRow {
+    char project[24];
+    char state[8];
+    char step[36];
+    int  ctx;                // context window used, %; -1 = unknown
+    int  n_agents;           // subagents running (may exceed those listed)
+    int  first_agent;        // index into SessionInfo.agents
+    int  n_listed;           // how many of them are listed there
+};
+
+struct AgentRow {
+    char type[18];           // "Explore", "general-purpose", ...
+    char step[36];           // what it is doing, "" before its first tool call
+};
+
 struct SessionInfo {
     char project[24];        // basename of the session's working dir
     char state[8];           // "work", "wait" (needs you), "done", "idle"
-    char tool[20];           // tool in use while working, "" otherwise
+    char step[36];           // what it is doing ("Editing ui.cpp"), "" otherwise
+    char model[18];          // from the status line; "" = not reported
+    int  ctx;                // context window used, %; -1 = unknown
+    // Every open session, the one above first (Sessions screen).
+    int  n_sessions;         // open sessions (may exceed those listed)
+    int  n_rows;
+    SessionRow rows[SESSION_ROWS_MAX];
+    int  n_agent_rows;
+    AgentRow agents[AGENT_ROWS_MAX];
 };

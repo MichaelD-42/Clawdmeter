@@ -37,15 +37,6 @@ void brightness_cycle(void) {
     save_and_apply();
 }
 
-void brightness_step(int dir) {
-    // Clamped rather than wrapping: turning a knob past the brightest level
-    // shouldn't drop it to the dimmest.
-    if (dir > 0 && cur_idx + 1 < LEVELS_COUNT) cur_idx++;
-    else if (dir < 0 && cur_idx > 0)           cur_idx--;
-    else return;
-    save_and_apply();
-}
-
 uint8_t brightness_get(void) {
     return LEVELS[cur_idx];
 }

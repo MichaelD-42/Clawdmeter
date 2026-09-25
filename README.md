@@ -244,7 +244,7 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 
 ## Session state and the needs-input alert
 
-The status line under the rings can show what Claude Code is doing ("Bash…", "Done", "Needs input") instead of the whimsical words. When Claude stops on a permission prompt or a question, the board wakes and a ring blinks around the edge of the panel, over whatever screen is up. It stops once the tool runs, or when you tap the screen.
+The status line under the rings can show what Claude Code is doing ("Build all seven board envs…", "Editing ui.cpp…", "Done", "Needs input") instead of the whimsical words. The step comes from the tool call itself: a command's description, the file being edited or read, an agent's task. When Claude stops on a permission prompt or a question, the board wakes and a ring blinks around the edge of the panel, over whatever screen is up. It stops once the tool runs, or when you tap the screen.
 
 This comes from Claude Code hooks. Each hook call hands its event to `daemon/clawdmeter_info.py`, which keeps one small file per session under `~/.cache/clawdmeter/sessions/`, and the daemon forwards any change within a second. Add this to `~/.claude/settings.json` on each machine, with the path pointing at your checkout (on Windows: `python %USERPROFILE%\Clawdmeter\daemon\clawdmeter_info.py hook`, with each backslash doubled inside the JSON):
 
@@ -256,12 +256,27 @@ This comes from Claude Code hooks. Each hook call hands its event to `daemon/cla
     "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "Notification":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }]
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }]
   }
 }
 ```
 
-The hook always exits 0 with no output, so it never blocks or changes anything Claude does. With several sessions open, a session that is waiting on you wins; otherwise the most recently active one is shown. Without the hooks the status line just reads "Idle"; only an older daemon leaves the old status words up.
+The hook always exits 0 with no output, so it never blocks or changes anything Claude does. With several sessions open, a session that is waiting on you wins; otherwise the most recently active one is shown. Without the hooks the status line just reads "Idle"; only an older daemon leaves the old status words up. On boards with a speaker, a session that starts waiting on you also knocks twice.
+
+### Sessions screen, model and context
+
+A third screen lists every open session: a dot in the state colour, the project and how full its context window is, then a line saying what it is doing, with each running subagent's step indented under it. The heading is the model. Tap through it after the usage view; on the Knob, turn the ring (one screen per detent, both ways). The round Knob layout also draws the context window as a third, inner ring.
+
+No hook reports the model or the context window, but the status line gets both. Pass its input on from your status line script:
+
+```bash
+input=$(cat)
+printf '%s' "$input" | python3 ~/Clawdmeter/daemon/clawdmeter_info.py status >/dev/null 2>&1 &
+```
+
+Without a status line of your own, point `statusLine` at `python3 ~/Clawdmeter/daemon/clawdmeter_info.py status` directly; it prints nothing, so the line stays empty. Without either, the screen still lists sessions and subagents, just without model and context.
 
 ## Physical buttons
 

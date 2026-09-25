@@ -34,10 +34,12 @@ void chime_play(void);
 // oscillator costs code, and these want to be plain beeps, not bells.
 //   ARMED  — one blip the moment releasing would pair ("now")
 //   PAIRED — a rising two-tone confirming the bonds were cleared
+//   ATTENTION — a double blip: a Claude Code session is waiting on you
 // Non-blocking and gated by the same busy flag as chime_play().
 enum chime_cue_t {
     CHIME_CUE_PAIR_ARMED,
     CHIME_CUE_PAIRED,
+    CHIME_CUE_ATTENTION,
 };
 void chime_play_cue(chime_cue_t cue);
 

@@ -70,6 +70,8 @@ struct cue_note { uint16_t freq_hz; uint16_t ms; };
 
 static const cue_note cue_armed[]  = { {880, 90} };
 static const cue_note cue_paired[] = { {660, 70}, {988, 130} };
+// 0 Hz is a gap: the two blips should read as a knock, not one long beep.
+static const cue_note cue_attention[] = { {988, 80}, {0, 70}, {988, 80} };
 
 static const cue_note* cue_seq = nullptr;
 static uint8_t         cue_len = 0;
@@ -114,8 +116,9 @@ static void cue_task(void* arg) {
 
 void chime_play_cue(chime_cue_t cue) {
     if (!ready || playing) return;
-    if (cue == CHIME_CUE_PAIRED) { cue_seq = cue_paired; cue_len = 2; }
-    else                         { cue_seq = cue_armed;  cue_len = 1; }
+    if (cue == CHIME_CUE_PAIRED)         { cue_seq = cue_paired;    cue_len = 2; }
+    else if (cue == CHIME_CUE_ATTENTION) { cue_seq = cue_attention; cue_len = 3; }
+    else                                 { cue_seq = cue_armed;     cue_len = 1; }
     playing = true;
     if (xTaskCreatePinnedToCore(cue_task, "chime_cue", 4096, nullptr, 1, nullptr, 0) != pdPASS)
         playing = false;   // couldn't spawn — stay silent rather than wedge the flag
