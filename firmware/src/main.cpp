@@ -156,6 +156,12 @@ static msg_kind_t parse_json(const char* json, UsageData* out, SessionInfo* sess
             row.n_listed = sess->n_agent_rows - row.first_agent;
             row.n_agents = r[5] | row.n_listed;
         }
+        // "pr": [id, project, tool, preview] — absent when nothing is asked.
+        JsonArray pr = doc["pr"].as<JsonArray>();
+        sess->pr_id = pr[0] | 0;
+        strlcpy(sess->pr_project, pr[1] | "", sizeof(sess->pr_project));
+        strlcpy(sess->pr_tool, pr[2] | "", sizeof(sess->pr_tool));
+        strlcpy(sess->pr_preview, pr[3] | "", sizeof(sess->pr_preview));
         return MSG_SESSION;
     }
 
@@ -181,7 +187,7 @@ static msg_kind_t parse_json(const char* json, UsageData* out, SessionInfo* sess
 }
 
 // ---- Serial command buffer ----
-#define CMD_BUF_SIZE 64
+#define CMD_BUF_SIZE 160   // room for a full 140-char `perm` preview
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -235,6 +241,16 @@ static void check_serial_cmd() {
             // device that is being flashed over that same cable.
             else if (strcmp(cmd_buf, "charge") == 0)   charge_anim_play(true);
             else if (strcmp(cmd_buf, "uncharge") == 0) charge_anim_play(false);
+            // Fake a permission prompt for screenshots: `perm <preview>` shows
+            // the approval overlay (id 0xBEEF), `perm off` takes it away.
+            else if (strncmp(cmd_buf, "perm ", 5) == 0) {
+                const bool off = strcmp(cmd_buf + 5, "off") == 0;
+                session.pr_id = off ? 0 : 0xBEEF;
+                strlcpy(session.pr_project, "Clawdmeter", sizeof(session.pr_project));
+                strlcpy(session.pr_tool, "Bash", sizeof(session.pr_tool));
+                strlcpy(session.pr_preview, off ? "" : cmd_buf + 5, sizeof(session.pr_preview));
+                ui_update_session(&session);
+            }
             // Force the splash buddy into a state (none/done/work/limit/wait/
             // celebrate) for screenshots; `mascot off` hands back to the data.
             else if (strncmp(cmd_buf, "mascot ", 7) == 0) {
@@ -424,6 +440,7 @@ void setup() {
 
     ui_init();
     if (board_caps().touch_keys) ui_set_touch_keys(&touch_keys);
+    ui_set_permission_answer(ble_send_answer);
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
@@ -660,9 +677,11 @@ void loop() {
         if (kind == MSG_SESSION) {
             // Claude is stuck on a question: light the panel up so the alert
             // is seen, not just drawn on a dark screen, and knock once when
-            // it starts waiting (not on every repeat of the same state).
+            // it starts waiting (not on every repeat of the same state). A
+            // permission prompt for the board counts from the moment it
+            // arrives — the "wait" notification only follows ~6 s later.
             static bool was_waiting = false;
-            const bool waiting = strcmp(session.state, "wait") == 0;
+            const bool waiting = strcmp(session.state, "wait") == 0 || session.pr_id;
             if (waiting) idle_note_activity();
             if (waiting && !was_waiting) sound_hal_play_attention();
             was_waiting = waiting;

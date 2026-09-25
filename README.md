@@ -258,7 +258,8 @@ This comes from Claude Code hooks. Each hook call hands its event to `daemon/cla
     "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
-    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }]
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py permit", "timeout": 600 }] }]
   }
 }
 ```
@@ -277,6 +278,10 @@ printf '%s' "$input" | python3 ~/Clawdmeter/daemon/clawdmeter_info.py status >/d
 ```
 
 Without a status line of your own, point `statusLine` at `python3 ~/Clawdmeter/daemon/clawdmeter_info.py status` directly; it prints nothing, so the line stays empty. Without either, the screen still lists sessions and subagents, just without model and context.
+
+### Allow or deny from the board
+
+With the `PermissionRequest` hook above, a permission prompt also appears on the board: the project and tool, the command, path or URL in question (cut previews end in `...`), and **Deny** / **Allow**. The terminal dialog stays up at the same time; whichever you answer first wins, and answering in the terminal takes the prompt off the board. `approve = off` in the daemon config turns it off.
 
 ## Physical buttons
 
@@ -299,6 +304,7 @@ The device advertises a custom GATT service alongside the standard HID keyboard 
 | **Data Service**           | `4c41555a-4465-7669-6365-000000000001` |
 | RX Characteristic (write)  | `4c41555a-4465-7669-6365-000000000002` |
 | TX Characteristic (notify) | `4c41555a-4465-7669-6365-000000000003` |
+| REQ Characteristic (notify) | `4c41555a-4465-7669-6365-000000000004` |
 | **HID Service**            | `00001812-0000-1000-8000-00805f9b34fb` |
 
 JSON payload format (written to RX):
@@ -315,7 +321,9 @@ Session-state messages are written to the same characteristic, whenever the stat
 { "ev": 1, "p": "Clawdmeter", "st": "work", "tl": "Bash" }
 ```
 
-`p` = project (working-directory name), `st` = `work` / `wait` (needs input) / `done` / `idle`, `tl` = tool in use.
+`p` = project (the workspace root's name, `CLAUDE_PROJECT_DIR`), `st` = `work` / `wait` (needs input) / `done` / `idle`, `tl` = tool in use. `pr` = `[id, project, tool, preview]` while a permission prompt waits for the board.
+
+The board notifies on REQ: `01` = send the data again (it has none yet), `02 lo hi` / `03 lo hi` = Allow / Deny tapped for request `hi lo`. On Linux the daemon keeps a `bluetoothctl` running to hold that subscription open — BlueZ ends a notify session as soon as the client that started it exits.
 
 ## Recompiling fonts
 

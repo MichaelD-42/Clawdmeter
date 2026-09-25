@@ -398,9 +398,17 @@ class Session:
         self.client = client
         self.refresh_requested = asyncio.Event()
 
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
-        self.refresh_requested.set()
+    def _on_refresh(self, _char, data: bytearray) -> None:
+        # 01 = send data again; 02 / 03 lo hi = Allow / Deny on the board for
+        # permission request <hi><lo>, handed to the waiting hook.
+        if len(data) == 3 and data[0] in (0x02, 0x03):
+            rid = f"{data[2]:02x}{data[1]:02x}"
+            answer = "allow" if data[0] == 0x02 else "deny"
+            ok = clawdmeter_info.write_answer(rid, answer, state_dir=clawdmeter_info.STATE_DIR)
+            log(f"Board: {answer} {rid}" + ("" if ok else " (no such request)"))
+        elif bytes(data[:1]) == b"\x01":
+            log("Refresh requested by device")
+            self.refresh_requested.set()
 
     async def setup_refresh_subscription(self) -> None:
         # The refresh subscription is optional — the 60s poll loop works without it.

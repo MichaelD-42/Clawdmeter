@@ -56,6 +56,8 @@ bool ui_pair_overlay_active(void);
 // prompt or question) blinks a ring around the panel edge over whichever
 // screen is showing, until the state moves on or a tap dismisses it.
 void ui_update_session(const SessionInfo* s);
+// Called when Allow / Deny is tapped on a permission prompt (SessionInfo.pr_*).
+void ui_set_permission_answer(void (*answer)(uint16_t id, bool allow));
 
 // What the touch gestures do on boards with BoardCaps.touch_keys (main.cpp
 // supplies the key actions). Ignored elsewhere — there every touch is a tap.

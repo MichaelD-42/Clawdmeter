@@ -28,6 +28,9 @@ const char* ble_get_data(void);
 void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
+// Allow / Deny tapped on a permission prompt: notifies 02|03 id_lo id_hi on
+// the REQ characteristic, the same path as the refresh request.
+void ble_send_answer(uint16_t id, bool allow);
 
 void ble_set_battery_level(int pct);
 

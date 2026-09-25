@@ -54,4 +54,9 @@ struct SessionInfo {
     SessionRow rows[SESSION_ROWS_MAX];
     int  n_agent_rows;
     AgentRow agents[AGENT_ROWS_MAX];
+    // A permission prompt waiting for Allow / Deny on the board ("pr").
+    uint16_t pr_id;          // 0 = none
+    char pr_project[24];
+    char pr_tool[24];
+    char pr_preview[144];    // the command / path / URL, <= 140 chars
 };

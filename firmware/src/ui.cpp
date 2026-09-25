@@ -84,6 +84,10 @@ struct Layout {
     int16_t sess_rows;               // row budget (<= SESS_ROWS_MAX)
     int16_t sess_x, sess_w;          // row span; narrower inside the circle on round panels
 
+    // Permission prompt overlay
+    int16_t perm_btn_h;
+    int16_t perm_pad_x, perm_pad_y;  // inset of its column from the panel edge
+
     // Pairing hint / idle screen
     int16_t pair_y1, pair_y2, pair_y3;
     int16_t idle_px;                 // sleeping-creature size on the idle screen
@@ -141,6 +145,9 @@ static void compute_layout(const BoardCaps& c) {
     L.sess_font = &font_styrene_24;
     L.sess_top = 110;
     L.sess_row_h = 42;
+    L.perm_btn_h = 64;
+    L.perm_pad_x = 20;
+    L.perm_pad_y = 28;
     L.sess_rows = 7;
 
     if (c.height >= 460) {
@@ -174,6 +181,7 @@ static void compute_layout(const BoardCaps& c) {
         L.sess_font = &font_styrene_20;
         L.sess_top = 90;
         L.sess_row_h = 36;
+        L.perm_btn_h = 52;
         L.sess_rows = 7;
     } else {
         // Small layout — tuned for 240x240 (LCD-1.54 and similar square TFTs).
@@ -220,6 +228,9 @@ static void compute_layout(const BoardCaps& c) {
         L.sess_font = &font_styrene_14;
         L.sess_top = 48;
         L.sess_row_h = 26;
+        L.perm_btn_h = 40;
+        L.perm_pad_x = 10;
+        L.perm_pad_y = 12;
         L.sess_rows = 6;
     }
 
@@ -276,6 +287,10 @@ static void compute_layout(const BoardCaps& c) {
         L.sess_font = &font_styrene_16;
         L.sess_top = 108;
         L.sess_row_h = 30;
+        // Permission prompt: text inside the inscribed square (side d/sqrt2).
+        L.perm_btn_h = 48;
+        L.perm_pad_x = mind * 15 / 100;
+        L.perm_pad_y = mind * 12 / 100;
         L.sess_rows = 6;
     }
 
@@ -348,6 +363,7 @@ static SessionInfo sess = {};
 static bool        sess_known = false;
 static bool        alert_on = false;         // needs-input ring blinking
 static bool        alert_dismissed = false;  // tapped away; stays away until the state moves on
+static bool        perm_on = false;          // approval overlay up
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -471,6 +487,7 @@ void ui_set_touch_keys(const UiTouchKeys* keys) { touch_keys = keys; }
 
 static bool alert_tap_dismiss(void);
 static void build_alert_ring(lv_obj_t* parent);
+static void build_perm_overlay(lv_obj_t* parent);
 
 // A tap walks splash -> usage -> sessions. With a rotary ring, the ring does
 // that instead: a tap then picks the next animation on the splash and goes
@@ -1095,6 +1112,7 @@ void ui_init(void) {
     // Above the usage view and the splash, below the charge overlay — the
     // pairing gesture can be started from either screen.
     build_pair_toast(scr);
+    build_perm_overlay(scr);   // under the ring, which keeps blinking around it
     build_alert_ring(scr);
 
     // Last, so the charge overlay covers everything else when it plays.
@@ -1382,7 +1400,7 @@ void ui_set_pair_state(pair_ui_t state) {
     lv_timer_resume(pair_toast_timer);
 }
 
-bool ui_pair_overlay_active(void) { return pair_ui_state != PAIR_UI_NONE || alert_on; }
+bool ui_pair_overlay_active(void) { return pair_ui_state != PAIR_UI_NONE || alert_on || perm_on; }
 
 // ---- Needs-input alert ----
 // A thick ring around the panel edge that blinks while Claude waits on you.
@@ -1437,6 +1455,118 @@ static bool alert_tap_dismiss(void) {
     alert_dismissed = true;
     set_alert(false);
     return true;
+}
+
+// ---- Permission prompt ----
+// Claude Code asks before running a tool; the hook puts the question on the
+// board (SessionInfo.pr_*) while the terminal dialog stays up, and whichever is
+// answered first wins. A full-screen card: what is asked on top, the command
+// in the mono font, Deny / Allow at the bottom. It takes every touch, so a
+// stray tap can't switch screens or type a key underneath.
+static lv_obj_t* perm_ov = nullptr;
+static lv_obj_t* perm_head = nullptr;
+static lv_obj_t* perm_body = nullptr;
+static uint16_t  perm_id = 0;          // the request on screen
+static uint16_t  perm_answered = 0;    // answered here; hidden until the host drops it
+static void (*perm_answer)(uint16_t id, bool allow) = nullptr;
+
+void ui_set_permission_answer(void (*answer)(uint16_t id, bool allow)) { perm_answer = answer; }
+
+static void show_perm(bool on) {
+    if (!perm_ov || on == perm_on) return;
+    perm_on = on;
+    if (on) {
+        lv_obj_clear_flag(perm_ov, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(perm_ov, LV_OBJ_FLAG_HIDDEN);
+        splash_request_full_redraw();   // the direct-draw splash froze under it
+    }
+}
+
+static void perm_btn_cb(lv_event_t* e) {
+    const bool allow = (bool)(uintptr_t)lv_event_get_user_data(e);
+    if (!perm_id) return;
+    if (perm_answer) perm_answer(perm_id, allow);
+    perm_answered = perm_id;
+    show_perm(false);
+}
+
+static lv_obj_t* make_perm_btn(lv_obj_t* parent, const char* text, bool allow) {
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, lv_pct(46), L.perm_btn_h);
+    lv_obj_set_style_radius(b, L.perm_btn_h / 2, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, allow ? COL_ACCENT : COL_PANEL, 0);
+    lv_obj_set_style_border_width(b, allow ? 0 : 2, 0);
+    lv_obj_set_style_border_color(b, COL_DIM, 0);
+    lv_obj_add_event_cb(b, perm_btn_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)allow);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(l, COL_TEXT, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+static void build_perm_overlay(lv_obj_t* parent) {
+    perm_ov = lv_obj_create(parent);
+    lv_obj_set_size(perm_ov, L.scr_w, L.scr_h);
+    lv_obj_set_pos(perm_ov, 0, 0);
+    lv_obj_set_style_bg_color(perm_ov, COL_BG, 0);
+    lv_obj_set_style_bg_opa(perm_ov, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(perm_ov, 0, 0);
+    lv_obj_set_style_radius(perm_ov, L.round ? LV_RADIUS_CIRCLE : 0, 0);
+    // On the round panel only the inscribed square is safe for text.
+    lv_obj_set_style_pad_hor(perm_ov, L.perm_pad_x, 0);
+    lv_obj_set_style_pad_ver(perm_ov, L.perm_pad_y, 0);
+    lv_obj_set_style_pad_row(perm_ov, L.margin / 2, 0);
+    lv_obj_clear_flag(perm_ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(perm_ov, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(perm_ov, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    perm_head = lv_label_create(perm_ov);
+    lv_obj_set_width(perm_head, lv_pct(100));
+    lv_label_set_long_mode(perm_head, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(perm_head, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(perm_head, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(perm_head, COL_ACCENT, 0);
+
+    perm_body = lv_label_create(perm_ov);
+    lv_obj_set_width(perm_body, lv_pct(100));
+    lv_obj_set_flex_grow(perm_body, 1);
+    lv_label_set_long_mode(perm_body, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(perm_body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(perm_body, &font_mono_18, 0);
+    lv_obj_set_style_text_color(perm_body, COL_TEXT, 0);
+
+    lv_obj_t* row = lv_obj_create(perm_ov);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    make_perm_btn(row, "Deny", false);
+    make_perm_btn(row, "Allow", true);
+
+    lv_obj_add_flag(perm_ov, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void update_perm(void) {
+    if (!perm_ov) return;
+    if (!sess.pr_id || sess.pr_id == perm_answered) {
+        if (!sess.pr_id) perm_answered = 0;
+        perm_id = 0;
+        show_perm(false);
+        return;
+    }
+    perm_id = sess.pr_id;
+    lv_label_set_text_fmt(perm_head, "%s - %s", sess.pr_project[0] ? sess.pr_project : "Claude",
+                          sess.pr_tool[0] ? sess.pr_tool : "Tool");
+    if (strcmp(lv_label_get_text(perm_body), sess.pr_preview) != 0)
+        lv_label_set_text(perm_body, sess.pr_preview);
+    show_perm(true);
 }
 
 // Sessions screen: lay the sessions out as lines, then show what fits the
@@ -1507,6 +1637,7 @@ void ui_update_session(const SessionInfo* s) {
     sess_known = true;
     if (!wait || project_changed) alert_dismissed = false;   // a new question asks again
     set_alert(wait && !alert_dismissed);
+    update_perm();
 
     update_sessions_screen();
     if (ring_ctx) {

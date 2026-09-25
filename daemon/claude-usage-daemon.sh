@@ -18,6 +18,7 @@ DBUS_DEST="org.bluez"
 NOTIFY_PID=""
 # Account label + Claude Code session state (see clawdmeter_info.py).
 INFO_PY="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/clawdmeter_info.py"
+REQ_AWK="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/req_notify.awk"
 SESSION_DIR="$HOME/.cache/clawdmeter/sessions"
 
 log() {
@@ -215,19 +216,24 @@ find_char_path_by_uuid() {
     done
 }
 
-# Subscribe to refresh-request notifications. The ESP fires this when it
-# has no usage data yet (e.g. after a fresh boot). Daemon awk drops a flag
-# file that the inner loop picks up on its next 5s tick.
+# Subscribe to the board's REQ notifications: a refresh request when it has
+# no usage data yet (e.g. after a fresh boot), which drops a flag file the
+# inner loop picks up on its next tick, and Allow / Deny taps on a permission
+# prompt, which go straight to `clawdmeter_info.py answer` (req_notify.awk).
 #
 # Implementation notes:
-# - dbus-monitor must be running BEFORE we call StartNotify, because busctl
-#   exits immediately, the subscription tears down within milliseconds, and
-#   the ESP's notify fires inside that brief window.
+# - BlueZ ends a notify session as soon as the D-Bus client that started it
+#   goes away, so a one-shot `busctl StartNotify` unsubscribes again within
+#   milliseconds. That was enough for the refresh request (fired inside that
+#   window), but taps come later: bluetoothctl holds the subscription for as
+#   long as it runs.
+# - dbus-monitor must be running BEFORE the subscription starts, because the
+#   ESP fires its refresh notify the moment it sees the subscribe.
 # - stdbuf -oL forces line-buffered stdout on dbus-monitor; without it,
 #   glibc switches to block buffering when stdout is a pipe and signals
 #   never reach awk until ~4KB accumulates.
-# - The pipeline runs in a setsid'd child so we can kill the whole process
-#   group (dbus-monitor + awk) atomically. Killing only awk leaves
+# - Everything runs in one setsid'd child so we can kill the whole process
+#   group (dbus-monitor + awk + bluetoothctl) atomically. Killing only awk leaves
 #   dbus-monitor orphaned, and `wait $!` in bash waits on the whole job
 #   until every pipeline member exits, hanging the daemon.
 start_notify_subscriber() {
@@ -238,13 +244,12 @@ start_notify_subscriber() {
         return 1
     fi
 
-    setsid bash -c "stdbuf -oL dbus-monitor --system \"type='signal',interface='org.freedesktop.DBus.Properties',path='$req_path',member='PropertiesChanged'\" 2>/dev/null | awk -v flag='$REFRESH_FLAG' '/Value/ { system(\"touch \" flag); fflush() }'" &
+    local listen hold
+    listen="stdbuf -oL dbus-monitor --system \"type='signal',interface='org.freedesktop.DBus.Properties',path='$req_path',member='PropertiesChanged'\" 2>/dev/null | awk -v flag='$REFRESH_FLAG' -v answer=\"python3 '$INFO_PY' answer\" -f '$REQ_AWK'"
+    hold="{ echo 'menu gatt'; echo 'select-attribute $req_path'; echo 'notify on'; exec sleep infinity; } | bluetoothctl >/dev/null 2>&1"
+    # The sleep gives dbus-monitor a moment to register its match rule.
+    setsid bash -c "$listen & sleep 0.3; $hold" &
     NOTIFY_PID=$!
-
-    # Give dbus-monitor a moment to register its match rule, then trigger
-    # the GATT subscription that causes the ESP to fire its notify.
-    sleep 0.3
-    busctl call "$DBUS_DEST" "$req_path" org.bluez.GattCharacteristic1 StartNotify >/dev/null 2>&1
 
     log "Refresh subscriber started (pgid=$NOTIFY_PID)"
 }
@@ -526,6 +531,10 @@ while true; do
                 rm -f "$REFRESH_FLAG"
             fi
             poll && LAST_POLL=$NOW
+            send_session_if_changed force
+        elif compgen -G "$SESSION_DIR/*.req" >/dev/null; then
+            # A permission prompt answered in the terminal kills its hook
+            # without touching the dir, so look every tick while one is open.
             send_session_if_changed force
         else
             send_session_if_changed

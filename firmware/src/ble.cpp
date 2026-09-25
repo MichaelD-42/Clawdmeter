@@ -524,6 +524,16 @@ void ble_request_refresh(void) {
     }
 }
 
+void ble_send_answer(uint16_t id, bool allow) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v[3] = { (uint8_t)(allow ? 0x02 : 0x03), (uint8_t)(id & 0xFF), (uint8_t)(id >> 8) };
+        req_char->setValue(v, sizeof(v));
+        req_char->notify();
+    }
+    Serial.printf("BLE: %s %04x%s\n", allow ? "allow" : "deny", id,
+                  state == BLE_STATE_CONNECTED ? "" : " (not connected)");
+}
+
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {
     if (state != BLE_STATE_CONNECTED || !input_kbd) return;
     // HID report: [modifier, reserved, key1, key2, key3, key4, key5, key6]
