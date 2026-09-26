@@ -11,7 +11,7 @@ void mascot_note_state(MascotInput* in, const char* st) {
 MascotState mascot_step(MascotTracker* t, const MascotInput& in, uint32_t now_ms) {
     // The limit comes from the last usage payload even when it is stale — a
     // board that lost its daemon at 100 % is still looking at a used-up limit.
-    const bool limit = in.session_pct >= 100.0f || in.rejected;
+    const bool limit = in.session_pct >= 100.0f || in.weekly_pct >= 100.0f || in.rejected;
     if (t->was_limit && !limit) {
         t->celebrating = true;
         t->celebrate_from = now_ms;

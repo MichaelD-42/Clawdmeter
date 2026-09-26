@@ -52,6 +52,15 @@ static void should_sleep_at_the_limit_over_work() {
     CHECK(mascot_step(&t, at_limit("work"), 0) == MASCOT_LIMIT);
 }
 
+static void should_count_a_used_up_weekly_limit() {
+    MascotTracker t;
+    MascotInput i = in("work");
+    i.weekly_pct = 100;
+    CHECK(mascot_step(&t, i, 0) == MASCOT_LIMIT);
+    i.weekly_pct = 60;
+    CHECK(mascot_step(&t, i, 1) == MASCOT_CELEBRATE);
+}
+
 static void should_count_a_rejected_status_as_the_limit() {
     MascotTracker t;
     MascotInput i = in();
@@ -149,6 +158,7 @@ int main() {
     should_work_when_any_session_works();
     should_prefer_wait_over_work();
     should_sleep_at_the_limit_over_work();
+    should_count_a_used_up_weekly_limit();
     should_count_a_rejected_status_as_the_limit();
     should_prefer_wait_over_limit();
     should_celebrate_when_the_limit_clears_then_stop();

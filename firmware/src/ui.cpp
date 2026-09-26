@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "splash.h"
 #include "charge_anim.h"
+#include "countdown.h"
 #include <lvgl.h>
 #include <math.h>
 #include <time.h>
@@ -380,6 +381,7 @@ static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 // connected but no usage update landed within DATA_FRESH_MS, the pairing hint
 // when BLE is down. Re-evaluated every loop in ui_tick_anim().
 static lv_obj_t* idle_group;            // the "Zzz" idle screen
+static lv_obj_t* sleep_creature;        // its sleeping creature, lent to the limit screen
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
@@ -494,9 +496,9 @@ static bool alert_tap_dismiss(void);
 static void build_alert_ring(lv_obj_t* parent);
 static void build_perm_overlay(lv_obj_t* parent);
 
-// A tap walks splash -> usage -> sessions. With a rotary ring, the ring does
-// that instead: a tap then picks the next animation on the splash and goes
-// back to the splash from anywhere else.
+// A tap walks splash -> usage -> sessions -> limit. With a rotary ring, the
+// ring does that instead: a tap then picks the next animation on the splash
+// and goes back to the splash from anywhere else.
 static void tap_action(void) {
     if (alert_tap_dismiss()) return;
     if (!board_caps().has_encoder)                ui_step_screen(1);
@@ -917,8 +919,8 @@ static void build_idle_group(lv_obj_t* parent) {
     // A shrunk-down sleeping creature (reused claudepix "expression sleep" art)
     // sits between the header and the status line; the animated "Listening…"
     // status line carries the words, so no extra text is needed here.
-    lv_obj_t* creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
-    if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
+    sleep_creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
+    if (sleep_creature) lv_obj_align(sleep_creature, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
 }
@@ -1109,6 +1111,83 @@ static void sess_blink_cb(lv_timer_t* t) {
     }
 }
 
+// ---- Limit screen ----
+// A used-up limit: the sleeping creature above a countdown to the reset.
+// main.cpp switches here when the limit hits and feeds it via ui_set_limit().
+static lv_obj_t* limit_container;
+static lv_obj_t* limit_col;            // creature, time, caption, centred
+static lv_obj_t* lbl_limit_time;
+static lv_obj_t* lbl_limit_caption;
+static LimitKind limit_kind = LIMIT_NONE;
+static Countdown limit_cd;
+static bool      limit_enterprise = false;
+static uint32_t  limit_shown_s = UINT32_MAX;
+
+static void init_limit_screen(lv_obj_t* scr) {
+    limit_container = lv_obj_create(scr);
+    lv_obj_set_size(limit_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(limit_container, 0, 0);
+    lv_obj_set_style_bg_opa(limit_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(limit_container, 0, 0);
+    lv_obj_set_style_pad_all(limit_container, 0, 0);
+    lv_obj_clear_flag(limit_container, LV_OBJ_FLAG_SCROLLABLE);
+    attach_touch_actions(limit_container);
+    lv_obj_add_flag(limit_container, LV_OBJ_FLAG_HIDDEN);
+
+    limit_col = lv_obj_create(limit_container);
+    lv_obj_set_size(limit_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(limit_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(limit_col, 0, 0);
+    lv_obj_set_style_pad_all(limit_col, 0, 0);
+    lv_obj_set_style_pad_row(limit_col, 8, 0);
+    lv_obj_set_flex_flow(limit_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(limit_col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(limit_col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(limit_col, LV_OBJ_FLAG_CLICKABLE);   // taps fall through to the container
+    lv_obj_center(limit_col);
+
+    lbl_limit_time = lv_label_create(limit_col);
+    lv_obj_set_style_text_font(lbl_limit_time, L.pct_font, 0);
+    lv_obj_set_style_text_color(lbl_limit_time, COL_TEXT, 0);
+
+    lbl_limit_caption = lv_label_create(limit_col);
+    lv_obj_set_style_text_font(lbl_limit_caption, L.pace_font, 0);
+    lv_obj_set_style_text_color(lbl_limit_caption, COL_DIM, 0);
+    lv_label_set_text(lbl_limit_caption, "Limit reached");
+}
+
+// The idle screen and this one never show at once, and the C6 boards have no
+// RAM for a second creature canvas, so the one creature moves between them.
+static void place_sleep_creature(bool on_limit) {
+    if (!sleep_creature) return;
+    lv_obj_t* want = on_limit ? limit_col : idle_group;
+    if (lv_obj_get_parent(sleep_creature) == want) return;
+    lv_obj_set_parent(sleep_creature, want);
+    if (on_limit) lv_obj_move_to_index(sleep_creature, 0);
+    else          lv_obj_align(sleep_creature, LV_ALIGN_CENTER, 0, -20);
+}
+
+// The digits are proportional: size the label for the same text with every
+// digit a '0' (the widest) and left-align in it, so it doesn't jiggle sideways
+// as the seconds tick.
+static int32_t steady_text_width(const char* s, const lv_font_t* f) {
+    int32_t w = 0;
+    for (; *s; s++) w += lv_font_get_glyph_width(f, (*s >= '0' && *s <= '9') ? '0' : *s, 0);
+    return w;
+}
+
+static void limit_refresh(void) {
+    const uint32_t left = limit_kind == LIMIT_NONE ? UINT32_MAX - 1
+                                                   : countdown_left_s(limit_cd, lv_tick_get());
+    if (left == limit_shown_s) return;
+    limit_shown_s = left;
+    char buf[16];
+    if (limit_kind == LIMIT_NONE) strlcpy(buf, "-:--:--", sizeof(buf));
+    else                          countdown_format(left, buf, sizeof(buf));
+    lv_obj_set_width(lbl_limit_time, steady_text_width(buf, L.pct_font));
+    lv_label_set_text(lbl_limit_time, buf);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -1124,6 +1203,7 @@ void ui_init(void) {
 
     init_usage_screen(scr);
     init_sessions_screen(scr);
+    init_limit_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -1160,6 +1240,7 @@ void ui_update(const UsageData* data) {
     if (!data->valid) return;
     last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
     data_received = true;
+    limit_enterprise = data->enterprise;
 
     if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
         clock_base_epoch = data->clock_epoch;
@@ -1278,6 +1359,11 @@ static const char* state_text(const char* state, const char* step, lv_color_t* c
 }
 
 void ui_tick_anim(void) {
+    if (current_screen == SCREEN_LIMIT) {
+        splash_mini_tick();
+        limit_refresh();
+        return;
+    }
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
@@ -1355,14 +1441,17 @@ static void global_click_cb(lv_event_t* e) {
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(sessions_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(limit_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:   splash_show(); break;
     case SCREEN_USAGE:    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_SESSIONS: lv_obj_clear_flag(sessions_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_LIMIT:    lv_obj_clear_flag(limit_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
+    place_sleep_creature(screen == SCREEN_LIMIT);
 
     if (logo_img) {
         if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
@@ -1381,8 +1470,20 @@ void ui_step_screen(int dir) {
     int s = current_screen;
     do {
         s = (s + (dir > 0 ? 1 : SCREEN_COUNT - 1)) % SCREEN_COUNT;
-    } while (s == SCREEN_SESSIONS && !sess_known);
+    } while ((s == SCREEN_SESSIONS && !sess_known) || (s == SCREEN_LIMIT && limit_kind == LIMIT_NONE));
     ui_show_screen((screen_t)s);
+}
+
+void ui_set_limit(LimitKind kind, int reset_mins) {
+    if (kind != limit_kind) limit_cd = Countdown{};   // a different limit: start over
+    if (kind != LIMIT_NONE) countdown_anchor(&limit_cd, reset_mins, lv_tick_get());
+    limit_kind = kind;
+    lv_label_set_text(lbl_limit_caption,
+                      kind == LIMIT_WEEKLY  ? "Weekly limit" :
+                      kind == LIMIT_SESSION ? (limit_enterprise ? "Spending limit" : "5-hour limit")
+                                            : "Limit reached");
+    limit_shown_s = UINT32_MAX;
+    limit_refresh();
 }
 
 screen_t ui_get_current_screen(void) {

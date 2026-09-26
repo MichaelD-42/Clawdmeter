@@ -6,6 +6,7 @@
 
 #include "data.h"
 #include "ui.h"
+#include "countdown.h"
 #include "ble.h"
 #include "splash.h"
 #include "charge_anim.h"
@@ -35,6 +36,16 @@ static uint32_t      last_usage_ms = 0;
 static MascotState   mascot_shown  = MASCOT_NONE;
 static bool          mascot_forced = false;          // `mascot <state>` serial command
 static MascotState   mascot_forced_state = MASCOT_NONE;
+
+// Which used-up limit the limit screen counts down to. A "rejected" status
+// counts as the 5 h one, same as for the mascot.
+static void push_limit() {
+    int mins = 0;
+    const bool session_hit = usage.session_pct >= 100.0f || strcmp(usage.status, "rejected") == 0;
+    const LimitKind k = countdown_pick(session_hit, usage.session_reset_mins,
+                                       usage.weekly_pct >= 100.0f, usage.weekly_reset_mins, &mins);
+    ui_set_limit(k, mins);
+}
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -296,6 +307,15 @@ static void check_serial_cmd() {
                     mascot_forced_state = st;
                 }
             }
+            // Fake a used-up 5 h limit with <mins> to go for screenshots; the
+            // board switches to the countdown by itself. `limit off` clears it
+            // (celebrate). The next real payload overrides either.
+            else if (strncmp(cmd_buf, "limit ", 6) == 0) {
+                const bool off = strcmp(cmd_buf + 6, "off") == 0;
+                usage.session_pct = off ? 0 : 100;
+                usage.session_reset_mins = off ? 0 : atoi(cmd_buf + 6);
+                push_limit();
+            }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -304,10 +324,11 @@ static void check_serial_cmd() {
 }
 
 // The splash buddy follows what Claude is doing. Only the limit and its
-// release bring the splash up (and hold it there, see mascot_holds_splash);
-// the other states just change the animation — switching on every work/wait
-// flip made the sessions screen unreadable.
-// While true the splash stays up until the user switches away (no usage peek).
+// release switch screens: the limit to its countdown, the release to the
+// splash to celebrate. Both stay until the user switches away. The other
+// states just change the animation — switching on every work/wait flip made
+// the sessions screen unreadable.
+// While true the splash gets no usage peek.
 static bool mascot_holds_splash() {
     return mascot_shown == MASCOT_LIMIT || mascot_shown == MASCOT_CELEBRATE;
 }
@@ -318,6 +339,7 @@ static void mascot_tick() {
         MascotInput in;
         in.usage_fresh = usage.valid && millis() - last_usage_ms < USAGE_FRESH_MS;
         in.session_pct = usage.session_pct;
+        in.weekly_pct  = usage.weekly_pct;
         in.rejected    = strcmp(usage.status, "rejected") == 0;
         if (session.n_rows == 0) mascot_note_state(&in, session.state);  // older daemon
         for (int i = 0; i < session.n_rows; i++) mascot_note_state(&in, session.rows[i].state);
@@ -332,7 +354,8 @@ static void mascot_tick() {
     splash_set_mood(names, n);
     if (!mascot_holds_splash()) return;
     if (s == MASCOT_CELEBRATE) idle_note_activity();
-    if (ui_get_current_screen() != SCREEN_SPLASH) ui_show_screen(SCREEN_SPLASH);
+    const screen_t to = s == MASCOT_LIMIT ? SCREEN_LIMIT : SCREEN_SPLASH;
+    if (ui_get_current_screen() != to) ui_show_screen(to);
 }
 
 // Each board provides this. Must bring up the shared I2C bus (Wire.begin
@@ -743,6 +766,7 @@ void loop() {
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
+            push_limit();
             ble_send_ack();
         } else {
             ble_send_nack();

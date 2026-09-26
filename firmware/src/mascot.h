@@ -10,7 +10,7 @@ enum MascotState {
     MASCOT_NONE,        // nothing to say: the usage-rate groups pick
     MASCOT_DONE,        // a session just finished
     MASCOT_WORK,        // a session is working
-    MASCOT_LIMIT,       // the 5 h session limit is used up
+    MASCOT_LIMIT,       // the 5 h or weekly limit is used up
     MASCOT_WAIT,        // a session needs you
     MASCOT_CELEBRATE,   // the limit just cleared
 };
@@ -21,6 +21,7 @@ enum MascotState {
 struct MascotInput {
     bool  usage_fresh = false;  // a usage message arrived recently (daemon alive)
     float session_pct = 0;
+    float weekly_pct  = 0;
     bool  rejected    = false;  // the API reported the 5 h status as "rejected"
     bool  any_wait    = false;
     bool  any_work    = false;

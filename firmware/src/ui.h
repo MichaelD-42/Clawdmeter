@@ -1,11 +1,13 @@
 #pragma once
 #include "data.h"
 #include "ble.h"
+#include "countdown.h"
 
 enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
     SCREEN_SESSIONS,
+    SCREEN_LIMIT,       // countdown to the reset of a used-up limit
     SCREEN_COUNT,
 };
 
@@ -13,7 +15,8 @@ void ui_init(void);
 void ui_update(const UsageData* data);
 void ui_tick_anim(void);
 void ui_show_screen(screen_t screen);
-// Next (dir > 0) or previous screen: splash -> usage -> sessions, wrapping.
+// Next (dir > 0) or previous screen: splash -> usage -> sessions -> limit,
+// wrapping. The limit screen is only in the cycle while a limit is hit.
 void ui_step_screen(int dir);
 screen_t ui_get_current_screen(void);
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac);
@@ -56,6 +59,9 @@ bool ui_pair_overlay_active(void);
 // prompt or question) blinks a ring around the panel edge over whichever
 // screen is showing, until the state moves on or a tap dismisses it.
 void ui_update_session(const SessionInfo* s);
+// The used-up limit the limit screen counts down to (LIMIT_NONE = none), and
+// its minutes to reset from the latest payload. Call after ui_update().
+void ui_set_limit(LimitKind kind, int reset_mins);
 // Called when Allow / Deny is tapped on a permission prompt (SessionInfo.pr_*).
 void ui_set_permission_answer(void (*answer)(uint16_t id, bool allow));
 
