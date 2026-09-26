@@ -497,15 +497,17 @@ const char* ble_get_data(void) {
 
 void ble_send_ack(void) {
     if (state == BLE_STATE_CONNECTED && tx_char) {
-        tx_char->setValue("{\"ack\":true}");
-        tx_char->notify();
+        static const char msg[] = "{\"ack\":true}";
+        tx_char->setValue(msg);
+        tx_char->notify((const uint8_t*)msg, sizeof(msg) - 1);
     }
 }
 
 void ble_send_nack(void) {
     if (state == BLE_STATE_CONNECTED && tx_char) {
-        tx_char->setValue("{\"err\":true}");
-        tx_char->notify();
+        static const char msg[] = "{\"err\":true}";
+        tx_char->setValue(msg);
+        tx_char->notify((const uint8_t*)msg, sizeof(msg) - 1);
     }
 }
 
@@ -519,9 +521,21 @@ void ble_request_refresh(void) {
     if (state == BLE_STATE_CONNECTED && req_char) {
         uint8_t v = 0x01;
         req_char->setValue(&v, 1);
-        req_char->notify();
+        req_char->notify(&v, 1);
         Serial.println("BLE: refresh requested");
     }
+}
+
+void ble_send_answer(uint16_t id, bool allow) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v[3] = { (uint8_t)(allow ? 0x02 : 0x03), (uint8_t)(id & 0xFF), (uint8_t)(id >> 8) };
+        // With the bytes: a refresh request right behind this would otherwise
+        // replace the answer before it goes out (see ble_keyboard_press).
+        req_char->setValue(v, sizeof(v));
+        req_char->notify(v, sizeof(v));
+    }
+    Serial.printf("BLE: %s %04x%s\n", allow ? "allow" : "deny", id,
+                  state == BLE_STATE_CONNECTED ? "" : " (not connected)");
 }
 
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {
@@ -529,12 +543,15 @@ void ble_keyboard_press(uint8_t key, uint8_t modifier) {
     // HID report: [modifier, reserved, key1, key2, key3, key4, key5, key6]
     uint8_t report[8] = {modifier, 0, key, 0, 0, 0, 0, 0};
     input_kbd->setValue(report, sizeof(report));
-    input_kbd->notify();
+    // Pass the bytes: a bare notify() only marks the value dirty and the host
+    // task reads it later, so a release sent right after (double tap →
+    // Shift+Tab) overwrote the press before it ever went out.
+    input_kbd->notify(report, sizeof(report));
 }
 
 void ble_keyboard_release(void) {
     if (state != BLE_STATE_CONNECTED || !input_kbd) return;
     uint8_t report[8] = {0};
     input_kbd->setValue(report, sizeof(report));
-    input_kbd->notify();
+    input_kbd->notify(report, sizeof(report));
 }

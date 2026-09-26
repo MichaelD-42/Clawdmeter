@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "splash.h"
 #include "charge_anim.h"
+#include "countdown.h"
 #include <lvgl.h>
 #include <math.h>
 #include <time.h>
@@ -69,12 +70,24 @@ struct Layout {
     int16_t ring_label_r;            // radius of the quarter-mark labels, inside the rings
     const lv_font_t* ring_label_font;
 
-    // Gauge colours: track, and fill below the 50 / 80 % warning levels
+    // Gauge colours: track, and fill below the first warning level (pct_color)
     lv_color_t gauge_track;
     lv_color_t gauge_ok;
     const lv_font_t* week_pct_font;  // weekly number, one step below the session number
     int16_t r_s_label_y, r_s_pct_y, r_s_reset_y;
     int16_t r_w_row_y, r_w_reset_y;
+    int16_t r_ctx_y;                 // "Context NN%" caption for the third (inner) ring
+
+    // Sessions screen: fixed rows, one per session or subagent
+    const lv_font_t* sess_font;
+    int16_t sess_top;                // first row's top edge
+    int16_t sess_row_h;
+    int16_t sess_rows;               // row budget (<= SESS_ROWS_MAX)
+    int16_t sess_x, sess_w;          // row span; narrower inside the circle on round panels
+
+    // Permission prompt overlay
+    int16_t perm_btn_h;
+    int16_t perm_pad_x, perm_pad_y;  // inset of its column from the panel edge
 
     // Pairing hint / idle screen
     int16_t pair_y1, pair_y2, pair_y3;
@@ -130,6 +143,13 @@ static void compute_layout(const BoardCaps& c) {
     L.pair_y2 = 120;
     L.pair_y3 = 160;
     L.idle_px = 160;
+    L.sess_font = &font_styrene_24;
+    L.sess_top = 110;
+    L.sess_row_h = 42;
+    L.perm_btn_h = 64;
+    L.perm_pad_x = 20;
+    L.perm_pad_y = 28;
+    L.sess_rows = 7;
 
     if (c.height >= 460) {
         // Large layout — tuned for 480x480 (AMOLED-2.16).
@@ -159,6 +179,11 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_20;
         L.bt_credit_1_font = &font_styrene_16;
         L.bt_credit_2_font = &font_styrene_14;
+        L.sess_font = &font_styrene_20;
+        L.sess_top = 90;
+        L.sess_row_h = 36;
+        L.perm_btn_h = 52;
+        L.sess_rows = 7;
     } else {
         // Small layout — tuned for 240x240 (LCD-1.54 and similar square TFTs).
         // Everything shrinks: fonts two steps down, panels ~half height, and
@@ -201,6 +226,13 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_14;
         L.bt_credit_1_font = &font_styrene_12;
         L.bt_credit_2_font = &font_styrene_12;
+        L.sess_font = &font_styrene_14;
+        L.sess_top = 48;
+        L.sess_row_h = 26;
+        L.perm_btn_h = 40;
+        L.perm_pad_x = 10;
+        L.perm_pad_y = 12;
+        L.sess_rows = 6;
     }
 
     if (c.is_round) {
@@ -218,7 +250,7 @@ static void compute_layout(const BoardCaps& c) {
         L.ring_start = 135;
         L.ring_end = 45;
         L.ring_tick_w = 3;
-        L.ring_label_r = 128;
+        L.ring_label_r = 108;   // inside the third (context) ring
         L.ring_label_font = &font_styrene_12;
         // Lighter track, so the unfilled part of the scale is visible too.
         // Fill goes green / amber / red like the bars.
@@ -236,11 +268,12 @@ static void compute_layout(const BoardCaps& c) {
         L.anim_y = -40;
         // Under the status line, in what is left of the ring gap.
         L.account_y = -16;
-        L.r_s_label_y = -60;
-        L.r_s_pct_y   = -26;
-        L.r_s_reset_y = 12;
-        L.r_w_row_y   = 50;
-        L.r_w_reset_y = 80;
+        L.r_s_label_y = -68;
+        L.r_s_pct_y   = -34;
+        L.r_s_reset_y = 4;
+        L.r_w_row_y   = 42;
+        L.r_w_reset_y = 70;
+        L.r_ctx_y     = 96;
         // Pairing hint and idle creature: the rings are hidden there, so the
         // full circle is available below the title.
         L.content_y = 118;
@@ -250,9 +283,21 @@ static void compute_layout(const BoardCaps& c) {
         L.idle_px = 160;
         L.bt_status_font = &font_styrene_28;
         L.bt_device_font = &font_styrene_20;
+        // Sessions: rows between the title and the bottom of the circle,
+        // narrow enough that the ends of the lowest row stay on the glass.
+        L.sess_font = &font_styrene_16;
+        L.sess_top = 108;
+        L.sess_row_h = 30;
+        // Permission prompt: text inside the inscribed square (side d/sqrt2).
+        L.perm_btn_h = 48;
+        L.perm_pad_x = mind * 15 / 100;
+        L.perm_pad_y = mind * 12 / 100;
+        L.sess_rows = 6;
     }
 
     L.content_w = L.scr_w - 2 * L.margin;
+    L.sess_x = L.round ? L.scr_w / 2 - 130 : L.margin;
+    L.sess_w = L.round ? 260 : L.content_w;
 }
 
 // Anthropic brand palette — design tokens live in theme.h
@@ -262,8 +307,10 @@ static void compute_layout(const BoardCaps& c) {
 #define COL_DIM       THEME_DIM
 #define COL_ACCENT    THEME_ACCENT
 #define COL_GREEN     THEME_GREEN
+#define COL_YELLOW    THEME_YELLOW
 #define COL_AMBER     THEME_AMBER
 #define COL_RED       THEME_RED
+#define COL_BLUE      THEME_BLUE
 #define COL_BAR_BG    THEME_BAR_BG
 
 // ---- Usage screen widgets (single non-splash view) ----
@@ -296,7 +343,25 @@ static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
 static lv_obj_t* lbl_anim;      // status line: connection state + session state
+static lv_obj_t* lbl_model;     // the active session's model, rectangular layouts
 static lv_obj_t* lbl_account;   // "Name · Plan", round layout only
+static lv_obj_t* ring_ctx;      // context window fill, round layout only (third ring)
+static lv_obj_t* lbl_ctx;       // its "Context NN%" caption
+
+// ---- Sessions screen ----
+// Fixed one-line rows, filled top-down on each ui_update_session(): per
+// session a head line (state dot, project, context %), a step line while it
+// works or waits, then one indented line per subagent with its step, and
+// "+N more" when the budget runs out. One column: two would cut every step
+// to a dozen characters on the round panel.
+#define SESS_ROWS_MAX 7
+static lv_obj_t* sessions_container;
+static lv_obj_t* lbl_sess_title;
+static lv_obj_t* sess_dot[SESS_ROWS_MAX];
+static lv_obj_t* sess_text[SESS_ROWS_MAX];
+static bool      sess_blink[SESS_ROWS_MAX];   // waiting: the dot blinks
+static lv_timer_t* sess_blink_timer = nullptr;
+static void sess_blink_cb(lv_timer_t* t);
 
 // Claude Code session state (ui_update_session). Until the first one arrives
 // — an older daemon, or no hooks installed — the whimsical words stay.
@@ -304,6 +369,7 @@ static SessionInfo sess = {};
 static bool        sess_known = false;
 static bool        alert_on = false;         // needs-input ring blinking
 static bool        alert_dismissed = false;  // tapped away; stays away until the state moves on
+static bool        perm_on = false;          // approval overlay up
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -315,6 +381,7 @@ static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 // connected but no usage update landed within DATA_FRESH_MS, the pairing hint
 // when BLE is down. Re-evaluated every loop in ui_tick_anim().
 static lv_obj_t* idle_group;            // the "Zzz" idle screen
+static lv_obj_t* sleep_creature;        // its sleeping creature, lent to the limit screen
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
@@ -380,9 +447,15 @@ static const char* const anim_messages[] = {
 };
 #define ANIM_MSG_COUNT (sizeof(anim_messages) / sizeof(anim_messages[0]))
 
+// Gauge fill escalates in four steps: green, yellow, amber, red.
+#define GAUGE_YELLOW_PCT 50.0f
+#define GAUGE_AMBER_PCT  70.0f
+#define GAUGE_RED_PCT    85.0f
+
 static lv_color_t pct_color(float pct) {
-    if (pct >= 80.0f) return COL_RED;
-    if (pct >= 50.0f) return COL_AMBER;
+    if (pct >= GAUGE_RED_PCT)    return COL_RED;
+    if (pct >= GAUGE_AMBER_PCT)  return COL_AMBER;
+    if (pct >= GAUGE_YELLOW_PCT) return COL_YELLOW;
     return L.gauge_ok;
 }
 
@@ -403,7 +476,7 @@ static void global_click_cb(lv_event_t* e);
 
 // ---- Touch as keys (BoardCaps.touch_keys) ----
 // Boards whose keys can't be reached map them onto the screen:
-//   tap        → toggle splash <-> usage, as everywhere
+//   tap        → tap_action(), as everywhere
 //   double tap → touch_keys->double_tap
 //   hold       → touch_keys->hold_start at LVGL's long-press time, then
 //                touch_keys->hold_end(held_ms) on release
@@ -421,12 +494,22 @@ void ui_set_touch_keys(const UiTouchKeys* keys) { touch_keys = keys; }
 
 static bool alert_tap_dismiss(void);
 static void build_alert_ring(lv_obj_t* parent);
+static void build_perm_overlay(lv_obj_t* parent);
+
+// A tap walks splash -> usage -> sessions -> limit. With a rotary ring, the
+// ring does that instead: a tap then picks the next animation on the splash
+// and goes back to the splash from anywhere else.
+static void tap_action(void) {
+    if (alert_tap_dismiss()) return;
+    if (!board_caps().has_encoder)                ui_step_screen(1);
+    else if (current_screen == SCREEN_SPLASH)     splash_next();
+    else                                          ui_show_screen(SCREEN_SPLASH);
+}
 
 static void tap_timer_cb(lv_timer_t* t) {
     (void)t;
     tap_timer = nullptr;   // one-shot; LVGL deletes it after this call
-    if (alert_tap_dismiss()) return;
-    ui_toggle_splash();
+    tap_action();
 }
 
 static void touch_key_cb(lv_event_t* e) {
@@ -533,7 +616,7 @@ static lv_obj_t* make_ring(lv_obj_t* parent, int diameter) {
 }
 
 // Quarter marks for the ring gauges: notches in the background colour cut
-// through both rings at 25 / 50 / 75 %, so a small fill can be read against
+// through all three rings at 25 / 50 / 75 %, so a small fill can be read against
 // the scale (the sweep is 270°, which makes 12 % look shorter than a clock
 // face would suggest). 0 and 100 % are the ring ends. lv_line keeps a pointer
 // to its points, hence the static array.
@@ -543,7 +626,7 @@ static void add_ring_ticks(lv_obj_t* parent) {
     if (L.ring_tick_w <= 0) return;
     const float c     = L.scr_w / 2.0f;   // round panels are square
     const float r_out = L.ring_d / 2.0f + 1;
-    const float r_in  = L.ring_d / 2.0f - 2 * L.ring_w - L.ring_gap - 1;
+    const float r_in  = L.ring_d / 2.0f - 3 * L.ring_w - 2 * L.ring_gap - 1;
     const int   sweep = (L.ring_end - L.ring_start + 360) % 360;
     for (int i = 0; i < 3; i++) {
         const float rad = (L.ring_start + sweep * (i + 1) / 4.0f) * (float)M_PI / 180.0f;
@@ -680,11 +763,14 @@ static lv_obj_t* make_centered_label(lv_obj_t* parent, const char* text,
 // become rings, the pills become plain captions.
 static void build_round_usage(lv_obj_t* parent) {
     panel_session = make_layer(parent);
+    lv_obj_t* panel_ctx = make_layer(parent);
     panel_weekly  = make_layer(parent);
 
     bar_session = make_ring(panel_session, L.ring_d);
+    ring_ctx    = make_ring(panel_ctx, L.ring_d - 4 * (L.ring_w + L.ring_gap));
     bar_weekly  = make_ring(panel_weekly, L.ring_d - 2 * (L.ring_w + L.ring_gap));
-    add_ring_ticks(panel_weekly);   // last layer, so the notches cut both rings
+    add_ring_ticks(panel_weekly);   // last layer, so the notches cut all rings
+    lbl_ctx = make_centered_label(panel_ctx, "", L.pace_font, COL_DIM, L.r_ctx_y);
 
     lbl_session_label = make_centered_label(panel_session, "Current", L.pill_font, COL_DIM, L.r_s_label_y);
     lbl_session_pct   = make_centered_label(panel_session, "---%", L.pct_font, COL_TEXT, L.r_s_pct_y);
@@ -833,8 +919,8 @@ static void build_idle_group(lv_obj_t* parent) {
     // A shrunk-down sleeping creature (reused claudepix "expression sleep" art)
     // sits between the header and the status line; the animated "Listening…"
     // status line carries the words, so no extra text is needed here.
-    lv_obj_t* creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
-    if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
+    sleep_creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
+    if (sleep_creature) lv_obj_align(sleep_creature, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
 }
@@ -849,13 +935,16 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
     attach_touch_actions(usage_container);
 
-    lbl_title = lv_label_create(usage_container);
-    lv_label_set_text(lbl_title, "Usage");
-    lv_obj_set_style_text_font(lbl_title, L.title_font, 0);
-    lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
-    // The nudge balances the corner logo on the left; smaller on small
-    // screens where the logo is 40px and the battery icon sits closer.
-    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+    // No title on round panels: the third ring takes its place.
+    if (!L.round) {
+        lbl_title = lv_label_create(usage_container);
+        lv_label_set_text(lbl_title, "Usage");
+        lv_obj_set_style_text_font(lbl_title, L.title_font, 0);
+        lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
+        // The nudge balances the corner logo on the left; smaller on small
+        // screens where the logo is 40px and the battery icon sits closer.
+        lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+    }
 
     // Usage panels (shown when connected) live in a transparent full-size group
     // so they can be toggled against the pairing hint as one unit.
@@ -919,7 +1008,184 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_label_set_text(lbl_anim, "");
     lv_obj_set_style_text_font(lbl_anim, L.anim_font, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
+    lv_obj_set_style_text_align(lbl_anim, LV_TEXT_ALIGN_CENTER, 0);
+    // Steps can be long ("Build all seven board envs"): cut with "..." at the
+    // panel edge, or between the ring ends on round panels.
+    lv_label_set_long_mode(lbl_anim, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(lbl_anim, L.round ? 230 : L.content_w,
+                    lv_font_get_line_height(L.anim_font));
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
+
+    // The model, small and dim, right above the status line. The round
+    // layout shows it inside the context ring instead (lbl_ctx).
+    if (!L.round) {
+        const lv_font_t* f = L.small_icons ? &font_styrene_12 : &font_styrene_14;
+        lbl_model = lv_label_create(usage_container);
+        lv_label_set_text(lbl_model, "");
+        lv_obj_set_style_text_font(lbl_model, f, 0);
+        lv_obj_set_style_text_color(lbl_model, COL_DIM, 0);
+        lv_obj_align(lbl_model, LV_ALIGN_BOTTOM_MID, 0,
+                     L.anim_y - lv_font_get_line_height(L.anim_font));
+    }
+}
+
+// ======== Sessions Screen ========
+
+static void init_sessions_screen(lv_obj_t* scr) {
+    sessions_container = lv_obj_create(scr);
+    lv_obj_set_size(sessions_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(sessions_container, 0, 0);
+    lv_obj_set_style_bg_opa(sessions_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sessions_container, 0, 0);
+    lv_obj_set_style_pad_all(sessions_container, 0, 0);
+    lv_obj_clear_flag(sessions_container, LV_OBJ_FLAG_SCROLLABLE);
+    attach_touch_actions(sessions_container);
+    lv_obj_add_flag(sessions_container, LV_OBJ_FLAG_HIDDEN);
+
+    lbl_sess_title = lv_label_create(sessions_container);
+    lv_label_set_text(lbl_sess_title, "Sessions");
+    lv_obj_set_style_text_font(lbl_sess_title, L.title_font, 0);
+    lv_obj_set_style_text_color(lbl_sess_title, COL_TEXT, 0);
+    lv_obj_align(lbl_sess_title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+
+    const int16_t dot   = L.sess_row_h / 4;
+    const int16_t fh    = lv_font_get_line_height(L.sess_font);
+    for (int i = 0; i < L.sess_rows && i < SESS_ROWS_MAX; i++) {
+        const int16_t y = L.sess_top + i * L.sess_row_h;
+
+        sess_dot[i] = lv_obj_create(sessions_container);
+        lv_obj_set_size(sess_dot[i], dot, dot);
+        lv_obj_set_pos(sess_dot[i], L.sess_x, y + (fh - dot) / 2);
+        lv_obj_set_style_radius(sess_dot[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(sess_dot[i], 0, 0);
+        lv_obj_clear_flag(sess_dot[i], LV_OBJ_FLAG_CLICKABLE);
+
+        // Cut with "..." rather than wrapping into the next row; LONG_DOT
+        // only cuts at a fixed height. Recolour dims the context % on the
+        // head line.
+        sess_text[i] = lv_label_create(sessions_container);
+        lv_label_set_long_mode(sess_text[i], LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(sess_text[i], L.sess_font, 0);
+        lv_obj_set_height(sess_text[i], fh);
+        lv_label_set_recolor(sess_text[i], true);
+
+        lv_obj_add_flag(sess_dot[i], LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(sess_text[i], "");
+    }
+    sess_blink_timer = lv_timer_create(sess_blink_cb, 500, nullptr);
+    lv_timer_pause(sess_blink_timer);
+}
+
+// One line. `dot`: show the state dot (session head line) in `col`. `indent`
+// in dot widths past the dot column: 0 for head lines and notes, 1 below.
+static void set_sess_row(int i, bool dot, int indent, const char* text, lv_color_t col,
+                         bool blink = false) {
+    const int16_t d  = L.sess_row_h / 4;
+    const int16_t fh = lv_font_get_line_height(L.sess_font);
+    const int16_t y  = L.sess_top + i * L.sess_row_h;
+    const int16_t dx = L.sess_x + indent * 2 * d;   // subagents: one step in
+    const int16_t x  = dx + 2 * d;
+    sess_blink[i] = dot && blink;
+    if (dot) {
+        lv_obj_clear_flag(sess_dot[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(sess_dot[i], col, 0);
+        lv_obj_set_style_bg_opa(sess_dot[i], LV_OPA_COVER, 0);   // a blink may have left it off
+        lv_obj_set_pos(sess_dot[i], dx, y + (fh - d) / 2);
+    } else {
+        lv_obj_add_flag(sess_dot[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_pos(sess_text[i], x, y);
+    lv_obj_set_width(sess_text[i], L.sess_x + L.sess_w - x);
+    lv_label_set_text(sess_text[i], text);
+    lv_obj_set_style_text_color(sess_text[i], dot ? COL_TEXT : col, 0);
+}
+
+// Waiting dots blink, so the one state that needs you doesn't rely on colour.
+static void sess_blink_cb(lv_timer_t* t) {
+    (void)t;
+    static bool on = true;
+    on = !on;
+    for (int i = 0; i < L.sess_rows && i < SESS_ROWS_MAX; i++) {
+        if (!sess_blink[i]) continue;
+        lv_obj_set_style_bg_opa(sess_dot[i], on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
+}
+
+// ---- Limit screen ----
+// A used-up limit: the sleeping creature above a countdown to the reset.
+// main.cpp switches here when the limit hits and feeds it via ui_set_limit().
+static lv_obj_t* limit_container;
+static lv_obj_t* limit_col;            // creature, time, caption, centred
+static lv_obj_t* lbl_limit_time;
+static lv_obj_t* lbl_limit_caption;
+static LimitKind limit_kind = LIMIT_NONE;
+static Countdown limit_cd;
+static bool      limit_enterprise = false;
+static uint32_t  limit_shown_s = UINT32_MAX;
+
+static void init_limit_screen(lv_obj_t* scr) {
+    limit_container = lv_obj_create(scr);
+    lv_obj_set_size(limit_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(limit_container, 0, 0);
+    lv_obj_set_style_bg_opa(limit_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(limit_container, 0, 0);
+    lv_obj_set_style_pad_all(limit_container, 0, 0);
+    lv_obj_clear_flag(limit_container, LV_OBJ_FLAG_SCROLLABLE);
+    attach_touch_actions(limit_container);
+    lv_obj_add_flag(limit_container, LV_OBJ_FLAG_HIDDEN);
+
+    limit_col = lv_obj_create(limit_container);
+    lv_obj_set_size(limit_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(limit_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(limit_col, 0, 0);
+    lv_obj_set_style_pad_all(limit_col, 0, 0);
+    lv_obj_set_style_pad_row(limit_col, 8, 0);
+    lv_obj_set_flex_flow(limit_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(limit_col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(limit_col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(limit_col, LV_OBJ_FLAG_CLICKABLE);   // taps fall through to the container
+    lv_obj_center(limit_col);
+
+    lbl_limit_time = lv_label_create(limit_col);
+    lv_obj_set_style_text_font(lbl_limit_time, L.pct_font, 0);
+    lv_obj_set_style_text_color(lbl_limit_time, COL_TEXT, 0);
+
+    lbl_limit_caption = lv_label_create(limit_col);
+    lv_obj_set_style_text_font(lbl_limit_caption, L.pace_font, 0);
+    lv_obj_set_style_text_color(lbl_limit_caption, COL_DIM, 0);
+    lv_label_set_text(lbl_limit_caption, "Limit reached");
+}
+
+// The idle screen and this one never show at once, and the C6 boards have no
+// RAM for a second creature canvas, so the one creature moves between them.
+static void place_sleep_creature(bool on_limit) {
+    if (!sleep_creature) return;
+    lv_obj_t* want = on_limit ? limit_col : idle_group;
+    if (lv_obj_get_parent(sleep_creature) == want) return;
+    lv_obj_set_parent(sleep_creature, want);
+    if (on_limit) lv_obj_move_to_index(sleep_creature, 0);
+    else          lv_obj_align(sleep_creature, LV_ALIGN_CENTER, 0, -20);
+}
+
+// The digits are proportional: size the label for the same text with every
+// digit a '0' (the widest) and left-align in it, so it doesn't jiggle sideways
+// as the seconds tick.
+static int32_t steady_text_width(const char* s, const lv_font_t* f) {
+    int32_t w = 0;
+    for (; *s; s++) w += lv_font_get_glyph_width(f, (*s >= '0' && *s <= '9') ? '0' : *s, 0);
+    return w;
+}
+
+static void limit_refresh(void) {
+    const uint32_t left = limit_kind == LIMIT_NONE ? UINT32_MAX - 1
+                                                   : countdown_left_s(limit_cd, lv_tick_get());
+    if (left == limit_shown_s) return;
+    limit_shown_s = left;
+    char buf[16];
+    if (limit_kind == LIMIT_NONE) strlcpy(buf, "-:--:--", sizeof(buf));
+    else                          countdown_format(left, buf, sizeof(buf));
+    lv_obj_set_width(lbl_limit_time, steady_text_width(buf, L.pct_font));
+    lv_label_set_text(lbl_limit_time, buf);
 }
 
 // ======== Public API ========
@@ -936,6 +1202,8 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    init_sessions_screen(scr);
+    init_limit_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -961,6 +1229,7 @@ void ui_init(void) {
     // Above the usage view and the splash, below the charge overlay — the
     // pairing gesture can be started from either screen.
     build_pair_toast(scr);
+    build_perm_overlay(scr);   // under the ring, which keeps blinking around it
     build_alert_ring(scr);
 
     // Last, so the charge overlay covers everything else when it plays.
@@ -971,6 +1240,7 @@ void ui_update(const UsageData* data) {
     if (!data->valid) return;
     last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
     data_received = true;
+    limit_enterprise = data->enterprise;
 
     if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
         clock_base_epoch = data->clock_epoch;
@@ -979,7 +1249,7 @@ void ui_update(const UsageData* data) {
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
         clock_last_min = -1;
-        lv_label_set_text(lbl_title, "Usage");
+        if (lbl_title) lv_label_set_text(lbl_title, "Usage");
     }
 
     if (lbl_account) {
@@ -1077,7 +1347,23 @@ static void update_view_state(void) {
                       LV_OBJ_FLAG_HIDDEN);
 }
 
+// Words and colour for a session state. The status line and the Sessions
+// screen say the same thing.
+static const char* state_text(const char* state, const char* step, lv_color_t* color) {
+    if (strcmp(state, "work") == 0)  { *color = COL_ACCENT; return step[0] ? step : "Working"; }
+    if (strcmp(state, "wait") == 0)  { *color = COL_YELLOW; return "Needs input"; }
+    if (strcmp(state, "done") == 0)  { *color = COL_GREEN;  return "Done"; }
+    if (strcmp(state, "error") == 0) { *color = COL_RED;    return step[0] ? step : "Error"; }
+    *color = COL_DIM;
+    return "Idle";
+}
+
 void ui_tick_anim(void) {
+    if (current_screen == SCREEN_LIMIT) {
+        splash_mini_tick();
+        limit_refresh();
+        return;
+    }
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
@@ -1086,7 +1372,7 @@ void ui_tick_anim(void) {
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
-    if (clock_base_epoch > 0) {
+    if (clock_base_epoch > 0 && lbl_title) {
         time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
         struct tm tmv;
         gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
@@ -1127,14 +1413,9 @@ void ui_tick_anim(void) {
         text = (anim_msg_idx & 1) ? "No data" : "Listening";
     } else if (now - connected_at_ms < 5000) {
         text = "Connected";
-    } else if (sess_known && strcmp(sess.state, "work") == 0) {
-        text = sess.tool[0] ? sess.tool : "Working";
-    } else if (sess_known && strcmp(sess.state, "wait") == 0) {
-        text = "Needs input";  tail = "";  color = COL_RED;
-    } else if (sess_known && strcmp(sess.state, "done") == 0) {
-        text = "Done";  tail = "";  color = COL_GREEN;
     } else if (sess_known) {
-        text = "Idle";  tail = "";  color = COL_DIM;
+        text = state_text(sess.state, sess.step, &color);
+        if (strcmp(sess.state, "work") != 0) tail = "";
     } else {
         text = anim_messages[anim_msg_idx];
     }
@@ -1146,7 +1427,6 @@ void ui_tick_anim(void) {
     lv_obj_set_style_text_color(lbl_anim, color, 0);
 }
 
-static screen_t prev_non_splash_screen = SCREEN_USAGE;
 static void apply_battery_visibility(void) {
     if (!battery_img) return;
     if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
@@ -1155,34 +1435,55 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (alert_tap_dismiss()) return;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    tap_action();
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(sessions_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(limit_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
-    case SCREEN_SPLASH:  splash_show(); break;
-    case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SPLASH:   splash_show(); break;
+    case SCREEN_USAGE:    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SESSIONS: lv_obj_clear_flag(sessions_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_LIMIT:    lv_obj_clear_flag(limit_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
+    place_sleep_creature(screen == SCREEN_LIMIT);
 
     if (logo_img) {
         if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
         else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
     apply_battery_visibility();
+    if (screen == SCREEN_SESSIONS) lv_timer_resume(sess_blink_timer);
+    else                           lv_timer_pause(sess_blink_timer);
 }
 
-void ui_toggle_splash(void) {
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+void ui_step_screen(int dir) {
+    // The Sessions screen joins the cycle once a daemon has reported one;
+    // without the hooks it would only ever say "No sessions".
+    int s = current_screen;
+    do {
+        s = (s + (dir > 0 ? 1 : SCREEN_COUNT - 1)) % SCREEN_COUNT;
+    } while ((s == SCREEN_SESSIONS && !sess_known) || (s == SCREEN_LIMIT && limit_kind == LIMIT_NONE));
+    ui_show_screen((screen_t)s);
+}
+
+void ui_set_limit(LimitKind kind, int reset_mins) {
+    if (kind != limit_kind) limit_cd = Countdown{};   // a different limit: start over
+    if (kind != LIMIT_NONE) countdown_anchor(&limit_cd, reset_mins, lv_tick_get());
+    limit_kind = kind;
+    lv_label_set_text(lbl_limit_caption,
+                      kind == LIMIT_WEEKLY  ? "Weekly limit" :
+                      kind == LIMIT_SESSION ? (limit_enterprise ? "Spending limit" : "5-hour limit")
+                                            : "Limit reached");
+    limit_shown_s = UINT32_MAX;
+    limit_refresh();
 }
 
 screen_t ui_get_current_screen(void) {
@@ -1240,7 +1541,7 @@ void ui_set_pair_state(pair_ui_t state) {
     lv_timer_resume(pair_toast_timer);
 }
 
-bool ui_pair_overlay_active(void) { return pair_ui_state != PAIR_UI_NONE || alert_on; }
+bool ui_pair_overlay_active(void) { return pair_ui_state != PAIR_UI_NONE || alert_on || perm_on; }
 
 // ---- Needs-input alert ----
 // A thick ring around the panel edge that blinks while Claude waits on you.
@@ -1297,6 +1598,174 @@ static bool alert_tap_dismiss(void) {
     return true;
 }
 
+// ---- Permission prompt ----
+// Claude Code asks before running a tool; the hook puts the question on the
+// board (SessionInfo.pr_*) while the terminal dialog stays up, and whichever is
+// answered first wins. A full-screen card: what is asked on top, the command
+// in the mono font, Deny / Allow at the bottom. It takes every touch, so a
+// stray tap can't switch screens or type a key underneath.
+static lv_obj_t* perm_ov = nullptr;
+static lv_obj_t* perm_head = nullptr;
+static lv_obj_t* perm_body = nullptr;
+static uint16_t  perm_id = 0;          // the request on screen
+static uint16_t  perm_answered = 0;    // answered here; hidden until the host drops it
+static void (*perm_answer)(uint16_t id, bool allow) = nullptr;
+
+void ui_set_permission_answer(void (*answer)(uint16_t id, bool allow)) { perm_answer = answer; }
+
+static void show_perm(bool on) {
+    if (!perm_ov || on == perm_on) return;
+    perm_on = on;
+    if (on) {
+        lv_obj_clear_flag(perm_ov, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(perm_ov, LV_OBJ_FLAG_HIDDEN);
+        splash_request_full_redraw();   // the direct-draw splash froze under it
+    }
+}
+
+static void perm_btn_cb(lv_event_t* e) {
+    const bool allow = (bool)(uintptr_t)lv_event_get_user_data(e);
+    if (!perm_id) return;
+    if (perm_answer) perm_answer(perm_id, allow);
+    perm_answered = perm_id;
+    show_perm(false);
+}
+
+static lv_obj_t* make_perm_btn(lv_obj_t* parent, const char* text, bool allow) {
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, lv_pct(46), L.perm_btn_h);
+    lv_obj_set_style_radius(b, L.perm_btn_h / 2, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, allow ? COL_ACCENT : COL_PANEL, 0);
+    lv_obj_set_style_border_width(b, allow ? 0 : 2, 0);
+    lv_obj_set_style_border_color(b, COL_DIM, 0);
+    lv_obj_add_event_cb(b, perm_btn_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)allow);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(l, COL_TEXT, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+static void build_perm_overlay(lv_obj_t* parent) {
+    perm_ov = lv_obj_create(parent);
+    lv_obj_set_size(perm_ov, L.scr_w, L.scr_h);
+    lv_obj_set_pos(perm_ov, 0, 0);
+    lv_obj_set_style_bg_color(perm_ov, COL_BG, 0);
+    lv_obj_set_style_bg_opa(perm_ov, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(perm_ov, 0, 0);
+    lv_obj_set_style_radius(perm_ov, L.round ? LV_RADIUS_CIRCLE : 0, 0);
+    // On the round panel only the inscribed square is safe for text.
+    lv_obj_set_style_pad_hor(perm_ov, L.perm_pad_x, 0);
+    lv_obj_set_style_pad_ver(perm_ov, L.perm_pad_y, 0);
+    lv_obj_set_style_pad_row(perm_ov, L.margin / 2, 0);
+    lv_obj_clear_flag(perm_ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(perm_ov, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(perm_ov, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    perm_head = lv_label_create(perm_ov);
+    lv_obj_set_width(perm_head, lv_pct(100));
+    lv_label_set_long_mode(perm_head, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(perm_head, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(perm_head, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(perm_head, COL_ACCENT, 0);
+
+    perm_body = lv_label_create(perm_ov);
+    lv_obj_set_width(perm_body, lv_pct(100));
+    lv_obj_set_flex_grow(perm_body, 1);
+    lv_label_set_long_mode(perm_body, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(perm_body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(perm_body, &font_mono_18, 0);
+    lv_obj_set_style_text_color(perm_body, COL_TEXT, 0);
+
+    lv_obj_t* row = lv_obj_create(perm_ov);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    make_perm_btn(row, "Deny", false);
+    make_perm_btn(row, "Allow", true);
+
+    lv_obj_add_flag(perm_ov, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void update_perm(void) {
+    if (!perm_ov) return;
+    if (!sess.pr_id || sess.pr_id == perm_answered) {
+        if (!sess.pr_id) perm_answered = 0;
+        perm_id = 0;
+        show_perm(false);
+        return;
+    }
+    perm_id = sess.pr_id;
+    lv_label_set_text_fmt(perm_head, "%s - %s", sess.pr_project[0] ? sess.pr_project : "Claude",
+                          sess.pr_tool[0] ? sess.pr_tool : "Tool");
+    if (strcmp(lv_label_get_text(perm_body), sess.pr_preview) != 0)
+        lv_label_set_text(perm_body, sess.pr_preview);
+    show_perm(true);
+}
+
+// Sessions screen: lay the sessions out as lines, then show what fits the
+// row budget and count the rest into "+N more" (sessions and agents, not
+// lines). The daemon may already have left some out (n_sessions, n_agents).
+struct SessLine {
+    bool       dot;
+    int8_t     indent;
+    uint8_t    items;       // sessions / agents this line stands for
+    lv_color_t col;
+    bool       blink;       // waiting on you
+    char       text[80];
+};
+
+static void update_sessions_screen(void) {
+    static SessLine lines[SESSION_ROWS_MAX + AGENT_ROWS_MAX];
+    int n = 0;
+    int more = sess.n_sessions > sess.n_rows ? sess.n_sessions - sess.n_rows : 0;
+    for (int r = 0; r < sess.n_rows; r++) {
+        const SessionRow& row = sess.rows[r];
+        lv_color_t col;
+        state_text(row.state, "", &col);
+        // Working through subagents reads as its own state.
+        if (!strcmp(row.state, "work") && row.n_agents > 0) col = COL_BLUE;
+        const char* name = row.project[0] ? row.project : "Session";
+
+        SessLine& head = lines[n++];
+        head = { true, 0, 1, col, !strcmp(row.state, "wait"), "" };
+        if (row.ctx >= 0) snprintf(head.text, sizeof(head.text), "%s #b0aea5 %d%%#", name, row.ctx);
+        else              strlcpy(head.text, name, sizeof(head.text));
+
+        for (int a = 0; a < row.n_listed; a++) {
+            const AgentRow& ag = sess.agents[row.first_agent + a];
+            SessLine& line = lines[n++];
+            line = { true, 1, 1, COL_BLUE, false, "" };
+            const char* type = ag.type[0] ? ag.type : "Agent";
+            if (ag.objective[0]) snprintf(line.text, sizeof(line.text), "%s: %s", type, ag.objective);
+            else            strlcpy(line.text, type, sizeof(line.text));
+        }
+        more += row.n_agents - row.n_listed;
+    }
+
+    const int budget = L.sess_rows < SESS_ROWS_MAX ? L.sess_rows : SESS_ROWS_MAX;
+    const int shown  = (n > budget || more > 0) ? (n < budget - 1 ? n : budget - 1) : n;
+    for (int k = shown; k < n; k++) more += lines[k].items;
+
+    int i = 0;
+    for (; i < shown; i++)
+        set_sess_row(i, lines[i].dot, lines[i].indent, lines[i].text, lines[i].col, lines[i].blink);
+    if (sess.n_rows == 0) set_sess_row(i++, false, 0, "No sessions", COL_DIM);
+    if (more > 0) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "+%d more", more);
+        set_sess_row(i++, false, 0, buf, COL_DIM);
+    }
+    for (; i < budget; i++) set_sess_row(i, false, 0, "", COL_DIM);
+}
+
 void ui_update_session(const SessionInfo* s) {
     const bool wait = strcmp(s->state, "wait") == 0;
     const bool project_changed = strcmp(s->project, sess.project) != 0;
@@ -1304,6 +1773,16 @@ void ui_update_session(const SessionInfo* s) {
     sess_known = true;
     if (!wait || project_changed) alert_dismissed = false;   // a new question asks again
     set_alert(wait && !alert_dismissed);
+    update_perm();
+
+    update_sessions_screen();
+    // The model: inside the context ring on round panels, above the status
+    // line elsewhere.
+    if (ring_ctx) {
+        set_gauge(ring_ctx, sess.ctx < 0 ? 0 : sess.ctx, pct_color(sess.ctx));
+        lv_label_set_text(lbl_ctx, sess.model);
+    }
+    if (lbl_model) lv_label_set_text(lbl_model, sess.model);
 }
 
 void ui_set_pairing_rejected(bool rejected) {

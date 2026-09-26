@@ -1,33 +1,64 @@
 #!/usr/bin/env python3
 """Host-side extras for the Clawdmeter, shared by the Linux and Windows daemons.
 
-Three jobs, all local — no API calls:
+Five jobs, all local — no API calls:
 
   account  Who is logged in and on which plan, read from Claude Code's own
            account file (.claude.json -> oauthAccount).
   hook     A Claude Code hook: records what each session is doing in one small
            file per session, so concurrent hooks never write the same file.
-  session  Reduces those files to the one line the device shows, as the
-           {"ev":1,...} message the firmware understands.
+  status   Called from the Claude Code status line: records the model and how
+           full the context window is, which no hook reports.
+  session  Reduces those files to what the device shows, as the {"ev":1,...}
+           message the firmware understands.
+  permit   A PermissionRequest hook: puts the prompt on the board and waits for
+           Allow / Deny there. The terminal dialog stays up meanwhile, and
+           whichever is answered first wins.
 
 CLI (used by the bash daemon and by the hooks in ~/.claude/settings.json):
   clawdmeter_info.py hook              hook JSON on stdin
+  clawdmeter_info.py status            status line JSON on stdin
   clawdmeter_info.py session           prints the session message
   clawdmeter_info.py account [DIR]     prints ,"u":..,"pl":.. (payload fragment)
+  clawdmeter_info.py permit            PermissionRequest hook JSON on stdin
+  clawdmeter_info.py answer ID A       the board's answer (allow|deny|pass)
 """
 
 import json
 import os
+import random
 import re
+import signal
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 STATE_DIR = Path.home() / ".cache" / "clawdmeter" / "sessions"
 STALE_S = 2 * 3600  # a session silent this long has crashed or been abandoned
+AGENT_STALE_S = 600  # a subagent that ran no tool this long has died without a stop
 NAME_MAX = 20
 PROJECT_MAX = 20
-TOOL_MAX = 16
+STEP_MAX = 32
+AGENT_MAX = 16
+MODEL_MAX = 16
+MAX_SESSIONS = 4  # what the board has room for
+MAX_AGENTS = 8  # across all sessions
+MSG_MAX = 480  # the board's BLE receive buffer is 512 bytes
+PREVIEW_MAX = 140  # what the board's approval overlay has room for
+TOOL_MAX = 20
+PERMIT_MAX_S = 590  # just inside the hook's 600 s timeout
+PERMIT_POLL_S = 0.2
+ANSWERS = ("allow", "deny", "pass")
+
+if os.name == "nt":
+    CONFIG_FILE = (
+        Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        / "Clawdmeter"
+        / "config"
+    )
+else:
+    CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
 
 # Notification types where Claude is stuck until you act. idle_prompt is not
 # one of them: it fires a minute after a finished turn, which "done" already says.
@@ -89,27 +120,228 @@ def _session_file(state_dir: Path, session_id) -> Path | None:
     return state_dir / f"{sid}.json" if sid else None
 
 
-def _short_tool(name: str) -> str:
-    return (name or "").split("__")[-1][:TOOL_MAX]
+def _project(event: dict) -> str:
+    # The workspace the session was started in. Claude Code hands every hook
+    # CLAUDE_PROJECT_DIR; the event's cwd follows each `cd` into a subfolder.
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or ""
+    return Path(root).name[:PROJECT_MAX]
+
+
+def _ascii(text) -> str:
+    # The board's fonts only carry ASCII: fold accents ("Ü" -> "U"), drop the
+    # rest, and squeeze whitespace (descriptions can hold newlines).
+    folded = unicodedata.normalize("NFKD", str(text or ""))
+    return " ".join(folded.encode("ascii", "ignore").decode().split())
+
+
+def step_text(tool: str, tool_input) -> str:
+    """What a tool call is doing, in a few words: the Bash description, the
+    file being edited, an agent's task. The tool name only as a last resort."""
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    base = lambda key: Path(str(inp.get(key) or "")).name  # noqa: E731
+    tool = tool or ""
+    if tool == "Bash":
+        text = inp.get("description") or "Running a command"
+    elif tool in ("Edit", "MultiEdit", "NotebookEdit"):
+        text = f"Editing {base('file_path') or base('notebook_path')}"
+    elif tool == "Write":
+        text = f"Writing {base('file_path')}"
+    elif tool == "Read":
+        text = f"Reading {base('file_path')}"
+    elif tool in ("Grep", "Glob"):
+        text = f"Searching {inp.get('pattern') or ''}"
+    elif tool in ("Agent", "Task"):
+        text = inp.get("description") or "Delegating"
+    elif tool == "WebFetch":
+        text = "Reading " + re.sub(r"^\w+://([^/]*).*$", r"\1", str(inp.get("url") or ""))
+    elif tool == "WebSearch":
+        text = "Searching the web"
+    elif tool == "Skill":
+        text = "Using " + str(inp.get("skill") or "").split(":")[-1]
+    else:
+        text = tool.split("__")[-1]
+    return _ascii(text)[:STEP_MAX].rstrip()
+
+
+def preview_text(tool: str, tool_input) -> str:
+    """What a permission prompt is about, for the board to judge by: the full
+    command, the path, the URL — not the friendly step_text() summary."""
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    tool = tool or ""
+    if tool == "Bash":
+        text = inp.get("command") or ""
+    elif tool in ("Edit", "MultiEdit", "Write", "Read", "NotebookEdit"):
+        text = inp.get("file_path") or inp.get("notebook_path") or ""
+    elif tool == "WebFetch":
+        text = inp.get("url") or ""
+    elif tool == "WebSearch":
+        text = inp.get("query") or ""
+    else:
+        first = next((v for v in inp.values() if isinstance(v, str) and v), "")
+        text = f"{tool.split('__')[-1]} {first}"
+    text = _ascii(text)
+    # Say when it is cut: Allow on a command you can't see whole is a trap.
+    return text if len(text) <= PREVIEW_MAX else text[: PREVIEW_MAX - 3] + "..."
+
+
+def _clean(s) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", str(s or ""))
+
+
+def _write(path: Path, rec: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(rec), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read(path: Path) -> dict | None:
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _read_list(path: Path) -> list:
+    try:
+        items = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return items if isinstance(items, list) else []
+
+
+def _remove_session(path: Path) -> None:
+    # The session file plus its subagent files (<sid>.<agent>.agent), its
+    # status line record (<sid>.ctx) and its pending agent calls (<sid>.spawn).
+    sid = path.stem
+    path.unlink(missing_ok=True)
+    for f in [
+        *path.parent.glob(f"{sid}.*.agent"),
+        path.with_suffix(".ctx"),
+        path.with_suffix(".spawn"),
+    ]:
+        f.unlink(missing_ok=True)
+
+
+# ---- Subagent objectives --------------------------------------------------
+# What a subagent is for is the description of the Agent call that started
+# it, but SubagentStart does not say which call that was. A background agent
+# is linked exactly: the call's PostToolUse returns its agentId. A foreground
+# one takes the oldest pending call of its type from <sid>.spawn.
+
+
+def _agent_type(value) -> str:
+    return str(value or "").split(":")[-1][:AGENT_MAX]
+
+
+def _spawn_entry(event: dict) -> tuple:
+    inp = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    return (
+        _agent_type(inp.get("subagent_type") or "general-purpose"),
+        _ascii(inp.get("description"))[:STEP_MAX].rstrip(),
+    )
+
+
+def _note_spawn(sid: str, event: dict, now, state_dir: Path) -> None:
+    path = state_dir / f"{sid}.spawn"
+    items = [i for i in _read_list(path) if now - i.get("ts", 0) <= AGENT_STALE_S]
+    atype, desc = _spawn_entry(event)
+    items.append({"t": atype, "d": desc, "ts": now})
+    _write_list(path, items)
+
+
+def _take_spawn(sid: str, now, state_dir: Path, atype: str, desc=None) -> str:
+    # Remove and return the oldest pending call of this type (and description,
+    # if known); without one of the type, the oldest of any type.
+    path = state_dir / f"{sid}.spawn"
+    items = [i for i in _read_list(path) if now - i.get("ts", 0) <= AGENT_STALE_S]
+    pick = next(
+        (i for i in items if i.get("t") == atype and desc in (None, i.get("d"))), None
+    )
+    if pick is None and desc is None and items:
+        pick = items[0]
+    if pick is not None:
+        items.remove(pick)
+    _write_list(path, items)
+    return pick.get("d", "") if pick else (desc or "")
+
+
+def _write_list(path: Path, items: list) -> None:
+    if items:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(items), encoding="utf-8")
+        os.replace(tmp, path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _link_agent(sid: str, event: dict, now, state_dir: Path) -> None:
+    # PostToolUse of a background Agent call: its result names the new agent.
+    resp = event.get("tool_response")
+    aid = _clean(resp.get("agentId")) if isinstance(resp, dict) else ""
+    if not aid:
+        return
+    atype, desc = _spawn_entry(event)
+    path = state_dir / f"{sid}.{aid}.agent"
+    rec = _read(path) or {"t": atype, "tl": "", "t0": now}
+    rec["d"] = _take_spawn(sid, now, state_dir, atype, desc)
+    rec["ts"] = now
+    _write(path, rec)
+
+
+def _record_agent(event: dict, kind, sid: str, now, state_dir: Path) -> None:
+    # One file per subagent: parallel subagents fire hooks concurrently, and
+    # a shared file would lose updates.
+    aid = _clean(event.get("agent_id"))
+    if not aid:
+        return
+    path = state_dir / f"{sid}.{aid}.agent"
+    if kind == "SubagentStop":
+        path.unlink(missing_ok=True)
+        return
+    prev = _read(path)
+    if prev is None and kind != "SubagentStart":
+        return  # a tool call after the stop, or from an agent we never saw start
+    if prev is None:
+        atype = _agent_type(event.get("agent_type"))
+        prev = {"t": atype, "tl": "", "t0": now, "d": _take_spawn(sid, now, state_dir, atype)}
+    rec = prev
+    if kind in ("PreToolUse", "PostToolUse"):
+        rec["tl"] = step_text(event.get("tool_name"), event.get("tool_input"))
+    rec["ts"] = now
+    _write(path, rec)
 
 
 def record_hook(event: dict, now=None, state_dir: Path = STATE_DIR) -> None:
     path = _session_file(state_dir, event.get("session_id"))
     if path is None:
         return
+    now = time.time() if now is None else now
     kind = event.get("hook_event_name")
     if kind == "SessionEnd":
-        path.unlink(missing_ok=True)
+        _remove_session(path)
+        return
+    if kind in ("SubagentStart", "SubagentStop") or (
+        event.get("agent_id") and kind in ("PreToolUse", "PostToolUse")
+    ):
+        _record_agent(event, kind, path.stem, now, state_dir)
         return
     try:
         prev = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         prev = {}
     tool = prev.get("tl", "")
+    if event.get("tool_name") in ("Agent", "Task"):
+        if kind == "PreToolUse":
+            _note_spawn(path.stem, event, now, state_dir)
+        else:
+            _link_agent(path.stem, event, now, state_dir)
     if kind == "UserPromptSubmit":
         state, tool = "work", ""
     elif kind in ("PreToolUse", "PostToolUse"):
-        state, tool = "work", _short_tool(event.get("tool_name", ""))
+        state, tool = "work", step_text(event.get("tool_name"), event.get("tool_input"))
     elif kind == "Notification":
         ntype = event.get("notification_type")
         if ntype in WAIT_TYPES:
@@ -120,44 +352,251 @@ def record_hook(event: dict, now=None, state_dir: Path = STATE_DIR) -> None:
             return
     elif kind == "Stop":
         state, tool = "done", ""
+    elif kind == "StopFailure":
+        # The turn ended on an API error (rate limit, overload, auth, ...).
+        state = "error"
+        tool = _ascii(f"Error: {event.get('error_type') or 'unknown'}")[:STEP_MAX]
     else:
         return
-    project = Path(event.get("cwd") or "").name[:PROJECT_MAX]
+    _write(path, {"p": _project(event), "st": state, "tl": tool, "ts": now})
+
+
+def record_status(data: dict, now=None, state_dir: Path = STATE_DIR) -> None:
+    path = _session_file(state_dir, data.get("session_id"))
+    if path is None:
+        return
+    model = data.get("model")
+    ctx = data.get("context_window")
+    name = model.get("display_name") if isinstance(model, dict) else None
+    pct = ctx.get("used_percentage") if isinstance(ctx, dict) else None
     rec = {
-        "p": project,
-        "st": state,
-        "tl": tool,
+        "m": str(name or "")[:MODEL_MAX],
+        "cx": round(pct) if isinstance(pct, (int, float)) else -1,
         "ts": time.time() if now is None else now,
     }
-    state_dir.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec), encoding="utf-8")
-    os.replace(tmp, path)
+    _write(path.with_suffix(".ctx"), rec)
+
+
+def _agents(sid: str, now, state_dir: Path) -> list:
+    agents = []
+    for f in state_dir.glob(f"{sid}.*.agent"):
+        rec = _read(f)
+        if rec is None or now - rec.get("ts", 0) > AGENT_STALE_S:
+            f.unlink(missing_ok=True)
+            continue
+        agents.append(rec)
+    agents.sort(key=lambda r: r.get("t0", 0))
+    return [[a.get("t", ""), a.get("d", "")] for a in agents]
+
+
+def _fit(msg: dict) -> dict:
+    # Drop agents from the bottom of the list, then whole sessions, until the
+    # message fits the board's buffer. Row counts stay, so the board can still
+    # say "+N more".
+    def size() -> int:
+        return len(json.dumps(msg, separators=(",", ":")))
+
+    rows = msg["ss"]
+    for row in reversed(rows):
+        while row[4] and size() > MSG_MAX:
+            row[4].pop()
+    while len(rows) > 1 and size() > MSG_MAX:
+        rows.pop()
+    return msg
 
 
 def session_summary(now=None, state_dir: Path = STATE_DIR) -> dict:
     now = time.time() if now is None else now
-    recs = []
+    sessions = []
     for f in state_dir.glob("*.json") if state_dir.is_dir() else []:
-        try:
-            rec = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        rec = _read(f)
+        if rec is None:
             continue
         if now - rec.get("ts", 0) > STALE_S:
-            f.unlink(missing_ok=True)
+            _remove_session(f)
             continue
-        recs.append(rec)
-    if not recs:
-        return {"ev": 1, "st": "idle"}
+        sessions.append((f.stem, rec))
+    pr = pending_request(state_dir)
+    if not sessions:
+        return {"ev": 1, "st": "idle", **({"pr": pr} if pr else {})}
     # A session stuck on you beats a newer one that is busy on its own.
-    waiting = [r for r in recs if r.get("st") == "wait"]
-    best = max(waiting or recs, key=lambda r: r.get("ts", 0))
-    return {
+    sessions.sort(
+        key=lambda s: (s[1].get("st") == "wait", s[1].get("ts", 0)), reverse=True
+    )
+    rows, ctxs, n_agents = [], [], 0
+    for sid, rec in sessions[:MAX_SESSIONS]:
+        ctx = _read(state_dir / f"{sid}.ctx") or {}
+        ctxs.append(ctx)
+        agents = _agents(sid, now, state_dir)
+        shown = agents[: max(0, MAX_AGENTS - n_agents)]
+        n_agents += len(shown)
+        rows.append(
+            [
+                rec.get("p", ""),
+                rec.get("st", "idle"),
+                "",  # the step is the usage screen's business (top-level tl)
+                ctx.get("cx", -1),
+                shown,
+                len(agents),
+            ]
+        )
+    best, ctx = sessions[0][1], ctxs[0]
+    msg = {
         "ev": 1,
         "p": best.get("p", ""),
         "st": best.get("st", "idle"),
         "tl": best.get("tl", ""),
     }
+    if ctx:
+        msg["m"] = ctx.get("m", "")
+        msg["cx"] = ctx.get("cx", -1)
+    msg["sn"] = len(sessions)
+    msg["ss"] = rows
+    if pr:
+        msg["pr"] = pr
+    return _fit(msg)
+
+
+# ---- Permission requests ---------------------------------------------------
+# The hook writes <id>.req next to the session files (so the bash daemon's
+# dir-mtime check sees it) and holds an OS lock on <id>.lock for as long as it
+# waits. Answering in the terminal kills the hook without any cleanup, but the
+# lock dies with the process — that is how session_summary() tells a live
+# request from a leftover one. The daemon writes the board's answer to <id>.ans.
+
+
+def _lock(path: Path):
+    """Open and exclusively lock `path`; the open file, or None if it is held."""
+    f = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def _hook_gone(lock: Path) -> bool:
+    # Getting the lock means the hook that held it is no longer running.
+    probe = _lock(lock) if lock.exists() else None
+    if probe is not None:
+        probe.close()
+    return probe is not None or not lock.exists()
+
+
+def _drop_request(state_dir: Path, rid: str) -> None:
+    for ext in ("req", "ans", "lock"):
+        (state_dir / f"{rid}.{ext}").unlink(missing_ok=True)
+
+
+def _decision(answer: str) -> dict:
+    decision = {"behavior": answer}
+    if answer == "deny":
+        decision["message"] = "Denied on Clawdmeter"
+    out = {"hookEventName": "PermissionRequest", "decision": decision}
+    return {"hookSpecificOutput": out}
+
+
+def request_permission(
+    event: dict,
+    state_dir: Path = STATE_DIR,
+    wait=time.sleep,
+    approve: bool = True,
+    max_s: float = PERMIT_MAX_S,
+    poll_s: float = PERMIT_POLL_S,
+) -> dict | None:
+    """Put the prompt on the board and wait for its answer. Returns the hook
+    output for allow/deny, None to leave it to the terminal."""
+    if not approve:
+        return None
+    state_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        rid = f"{random.randint(1, 0xFFFF):04x}"
+        if not (state_dir / f"{rid}.lock").exists():
+            break
+    held = _lock(state_dir / f"{rid}.lock")
+    if held is None:
+        return None
+    try:
+        tool = event.get("tool_name") or ""
+        _write(
+            state_dir / f"{rid}.req",
+            {
+                "sid": _clean(event.get("session_id")),
+                "p": _project(event),
+                "t": _ascii(tool.split("__")[-1])[:TOOL_MAX],
+                "v": preview_text(tool, event.get("tool_input")),
+                "ts": time.time(),
+            },
+        )
+        ans_path = state_dir / f"{rid}.ans"
+        polls = round(max_s / poll_s)
+        for i in range(polls + 1):
+            try:
+                answer = ans_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                answer = ""
+            if answer in ("allow", "deny"):
+                return _decision(answer)
+            if answer == "pass":
+                return None
+            if i < polls:
+                wait(poll_s)
+        return None
+    finally:
+        held.close()
+        _drop_request(state_dir, rid)
+
+
+def write_answer(rid: str, answer: str, state_dir: Path = STATE_DIR) -> bool:
+    """The board's answer, for the waiting hook. Ignored unless the request
+    is still there."""
+    if not re.fullmatch(r"[0-9a-f]{4}", rid or "") or answer not in ANSWERS:
+        return False
+    if not (state_dir / f"{rid}.req").exists():
+        return False
+    (state_dir / f"{rid}.ans").write_text(answer, encoding="utf-8")
+    return True
+
+
+def pending_request(state_dir: Path = STATE_DIR) -> list | None:
+    """The oldest request whose hook is still waiting, as [id, project, tool,
+    preview]; leftovers of killed hooks are removed on the way."""
+    live = []
+    for f in state_dir.glob("*.req") if state_dir.is_dir() else []:
+        rid = f.stem
+        if _hook_gone(state_dir / f"{rid}.lock"):
+            _drop_request(state_dir, rid)
+            continue
+        rec = _read(f)
+        if rec is not None:
+            live.append((rec.get("ts", 0), rid, rec))
+    if not live:
+        return None
+    _, rid, rec = min(live)
+    return [int(rid, 16), rec.get("p", ""), rec.get("t", ""), rec.get("v", "")]
+
+
+def approve_enabled(config_file: Path = CONFIG_FILE) -> bool:
+    # `approve = off` in the daemon config turns the board's Allow / Deny off.
+    try:
+        lines = config_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return True
+    value = "on"
+    for line in lines:
+        m = re.match(r"\s*approve\s*=\s*(\S*)", line)
+        if m:
+            value = m.group(1).lower()
+    return value != "off"
 
 
 def main(argv) -> int:
@@ -169,6 +608,30 @@ def main(argv) -> int:
         except Exception:
             pass
         return 0
+    if cmd == "status":
+        # Runs on every status line refresh: same rules as the hook.
+        try:
+            record_status(json.load(sys.stdin))
+        except Exception:
+            pass
+        return 0
+    if cmd == "permit":
+        # Answering in the terminal ends us with SIGTERM: exit through the
+        # finally that removes the request. Never fail in Claude's way.
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+            event = json.load(sys.stdin)
+            out = request_permission(event, approve=approve_enabled())
+            if out:
+                print(json.dumps(out))
+        except Exception:
+            pass
+        return 0
+    if cmd == "answer":
+        if len(argv) != 4:
+            print(__doc__, file=sys.stderr)
+            return 2
+        return 0 if write_answer(argv[2], argv[3], state_dir=STATE_DIR) else 1
     if cmd == "session":
         print(json.dumps(session_summary(), separators=(",", ":")))
         return 0

@@ -6,10 +6,12 @@
 
 #include "data.h"
 #include "ui.h"
+#include "countdown.h"
 #include "ble.h"
 #include "splash.h"
 #include "charge_anim.h"
 #include "usage_rate.h"
+#include "mascot.h"
 #include "idle.h"
 #include "idle_cfg.h"
 #include "brightness.h"
@@ -24,6 +26,26 @@
 
 static UsageData usage = {};
 static SessionInfo session = {};
+
+// ---- Splash buddy (mascot.h) ----
+// Session states only count while usage keeps arriving (daemon polls ~60 s);
+// same window the UI uses to call its data live.
+#define USAGE_FRESH_MS 90000
+static MascotTracker mascot;
+static uint32_t      last_usage_ms = 0;
+static MascotState   mascot_shown  = MASCOT_NONE;
+static bool          mascot_forced = false;          // `mascot <state>` serial command
+static MascotState   mascot_forced_state = MASCOT_NONE;
+
+// Which used-up limit the limit screen counts down to. A "rejected" status
+// counts as the 5 h one, same as for the mascot.
+static void push_limit() {
+    int mins = 0;
+    const bool session_hit = usage.session_pct >= 100.0f || strcmp(usage.status, "rejected") == 0;
+    const LimitKind k = countdown_pick(session_hit, usage.session_reset_mins,
+                                       usage.weekly_pct >= 100.0f, usage.weekly_reset_mins, &mins);
+    ui_set_limit(k, mins);
+}
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -121,7 +143,36 @@ static msg_kind_t parse_json(const char* json, UsageData* out, SessionInfo* sess
     if (doc["ev"].is<int>()) {
         strlcpy(sess->project, doc["p"] | "", sizeof(sess->project));
         strlcpy(sess->state, doc["st"] | "idle", sizeof(sess->state));
-        strlcpy(sess->tool, doc["tl"] | "", sizeof(sess->tool));
+        strlcpy(sess->step, doc["tl"] | "", sizeof(sess->step));
+        strlcpy(sess->model, doc["m"] | "", sizeof(sess->model));
+        sess->ctx = doc["cx"] | -1;
+        sess->n_sessions = doc["sn"] | 0;
+        sess->n_rows = 0;
+        sess->n_agent_rows = 0;
+        // "ss": [[project, state, step, ctx, [[type, objective], ...], n_agents], ...]
+        for (JsonArray r : doc["ss"].as<JsonArray>()) {
+            if (sess->n_rows >= SESSION_ROWS_MAX) break;
+            SessionRow& row = sess->rows[sess->n_rows++];
+            strlcpy(row.project, r[0] | "", sizeof(row.project));
+            strlcpy(row.state, r[1] | "idle", sizeof(row.state));
+            strlcpy(row.step, r[2] | "", sizeof(row.step));
+            row.ctx = r[3] | -1;
+            row.first_agent = sess->n_agent_rows;
+            for (JsonArray a : r[4].as<JsonArray>()) {
+                if (sess->n_agent_rows >= AGENT_ROWS_MAX) break;
+                AgentRow& ag = sess->agents[sess->n_agent_rows++];
+                strlcpy(ag.type, a[0] | "", sizeof(ag.type));
+                strlcpy(ag.objective, a[1] | "", sizeof(ag.objective));
+            }
+            row.n_listed = sess->n_agent_rows - row.first_agent;
+            row.n_agents = r[5] | row.n_listed;
+        }
+        // "pr": [id, project, tool, preview] — absent when nothing is asked.
+        JsonArray pr = doc["pr"].as<JsonArray>();
+        sess->pr_id = pr[0] | 0;
+        strlcpy(sess->pr_project, pr[1] | "", sizeof(sess->pr_project));
+        strlcpy(sess->pr_tool, pr[2] | "", sizeof(sess->pr_tool));
+        strlcpy(sess->pr_preview, pr[3] | "", sizeof(sess->pr_preview));
         return MSG_SESSION;
     }
 
@@ -147,7 +198,7 @@ static msg_kind_t parse_json(const char* json, UsageData* out, SessionInfo* sess
 }
 
 // ---- Serial command buffer ----
-#define CMD_BUF_SIZE 64
+#define CMD_BUF_SIZE 160   // room for a full 140-char `perm` preview
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -189,6 +240,37 @@ static void send_screenshot() {
 #endif
 }
 
+static void show_session_demo() {
+    static SessionInfo demo;
+    demo = {};
+    strlcpy(demo.project, "Clawdmeter", sizeof(demo.project));
+    strlcpy(demo.state, "work", sizeof(demo.state));
+    strlcpy(demo.step, "Editing ui.cpp", sizeof(demo.step));
+    strlcpy(demo.model, "Opus 5.5", sizeof(demo.model));
+    demo.ctx = 42;
+    struct { const char* p; const char* st; int ctx; int agents; } rows[] = {
+        { "Clawdmeter", "work", 42, 2 }, { "homelab", "wait", 67, 0 },
+        { "signum-bot", "error", 12, 0 }, { "blog", "done", 88, 0 },
+    };
+    const char* agents[][2] = { { "Explore", "Find the HAL headers" }, { "Plan", "Design the overlay" } };
+    demo.n_sessions = 4;
+    for (auto& r : rows) {
+        SessionRow& row = demo.rows[demo.n_rows++];
+        strlcpy(row.project, r.p, sizeof(row.project));
+        strlcpy(row.state, r.st, sizeof(row.state));
+        row.ctx = r.ctx;
+        row.first_agent = demo.n_agent_rows;
+        for (int a = 0; a < r.agents; a++) {
+            AgentRow& ag = demo.agents[demo.n_agent_rows++];
+            strlcpy(ag.type, agents[a][0], sizeof(ag.type));
+            strlcpy(ag.objective, agents[a][1], sizeof(ag.objective));
+        }
+        row.n_listed = row.n_agents = r.agents;
+    }
+    ui_update_session(&demo);
+    ui_show_screen(SCREEN_SESSIONS);
+}
+
 static void check_serial_cmd() {
     while (Serial.available()) {
         char c = Serial.read();
@@ -201,11 +283,79 @@ static void check_serial_cmd() {
             // device that is being flashed over that same cable.
             else if (strcmp(cmd_buf, "charge") == 0)   charge_anim_play(true);
             else if (strcmp(cmd_buf, "uncharge") == 0) charge_anim_play(false);
+            // Fake a permission prompt for screenshots: `perm <preview>` shows
+            // the approval overlay (id 0xBEEF), `perm off` takes it away.
+            // Fill the sessions screen with made-up sessions for screenshots;
+            // `sessdemo off` puts the real ones back.
+            else if (strcmp(cmd_buf, "sessdemo") == 0)     show_session_demo();
+            else if (strcmp(cmd_buf, "sessdemo off") == 0) ui_update_session(&session);
+            else if (strncmp(cmd_buf, "perm ", 5) == 0) {
+                const bool off = strcmp(cmd_buf + 5, "off") == 0;
+                session.pr_id = off ? 0 : 0xBEEF;
+                strlcpy(session.pr_project, "Clawdmeter", sizeof(session.pr_project));
+                strlcpy(session.pr_tool, "Bash", sizeof(session.pr_tool));
+                strlcpy(session.pr_preview, off ? "" : cmd_buf + 5, sizeof(session.pr_preview));
+                ui_update_session(&session);
+            }
+            // Force the splash buddy into a state (none/done/work/limit/wait/
+            // celebrate) for screenshots; `mascot off` hands back to the data.
+            else if (strncmp(cmd_buf, "mascot ", 7) == 0) {
+                MascotState st;
+                if (strcmp(cmd_buf + 7, "off") == 0) mascot_forced = false;
+                else if (mascot_parse(cmd_buf + 7, &st)) {
+                    mascot_forced = true;
+                    mascot_forced_state = st;
+                }
+            }
+            // Fake a used-up 5 h limit with <mins> to go for screenshots; the
+            // board switches to the countdown by itself. `limit off` clears it
+            // (celebrate). The next real payload overrides either.
+            else if (strncmp(cmd_buf, "limit ", 6) == 0) {
+                const bool off = strcmp(cmd_buf + 6, "off") == 0;
+                usage.session_pct = off ? 0 : 100;
+                usage.session_reset_mins = off ? 0 : atoi(cmd_buf + 6);
+                push_limit();
+            }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
         }
     }
+}
+
+// The splash buddy follows what Claude is doing. Only the limit and its
+// release switch screens: the limit to its countdown, the release to the
+// splash to celebrate. Both stay until the user switches away. The other
+// states just change the animation — switching on every work/wait flip made
+// the sessions screen unreadable.
+// While true the splash gets no usage peek.
+static bool mascot_holds_splash() {
+    return mascot_shown == MASCOT_LIMIT || mascot_shown == MASCOT_CELEBRATE;
+}
+
+static void mascot_tick() {
+    MascotState s = mascot_forced_state;
+    if (!mascot_forced) {
+        MascotInput in;
+        in.usage_fresh = usage.valid && millis() - last_usage_ms < USAGE_FRESH_MS;
+        in.session_pct = usage.session_pct;
+        in.weekly_pct  = usage.weekly_pct;
+        in.rejected    = strcmp(usage.status, "rejected") == 0;
+        if (session.n_rows == 0) mascot_note_state(&in, session.state);  // older daemon
+        for (int i = 0; i < session.n_rows; i++) mascot_note_state(&in, session.rows[i].state);
+        s = mascot_step(&mascot, in, millis());
+    }
+    if (s == mascot_shown) return;
+    mascot_shown = s;
+    Serial.printf("mascot: %s\n", mascot_name(s));
+
+    int n;
+    const char* const* names = mascot_anims(s, &n);
+    splash_set_mood(names, n);
+    if (!mascot_holds_splash()) return;
+    if (s == MASCOT_CELEBRATE) idle_note_activity();
+    const screen_t to = s == MASCOT_LIMIT ? SCREEN_LIMIT : SCREEN_SPLASH;
+    if (ui_get_current_screen() != to) ui_show_screen(to);
 }
 
 // Each board provides this. Must bring up the shared I2C bus (Wire.begin
@@ -348,6 +498,7 @@ void setup() {
 
     ui_init();
     if (board_caps().touch_keys) ui_set_touch_keys(&touch_keys);
+    ui_set_permission_answer(ble_send_answer);
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
@@ -476,25 +627,21 @@ void loop() {
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // On splash: cycle animations. On the usage view: cycle
-                // screen brightness (single non-splash view, no more screens).
+                // On splash: cycle animations. Anywhere else: cycle screen
+                // brightness.
                 if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
                 else                                          brightness_cycle();
             }
         }
 
-        // Rotary ring: the PWR short press in both directions — next/previous
-        // animation on the splash, brighter/darker on the usage view. The
-        // first turn from sleep only wakes, like a first button press.
+        // Rotary ring: one screen per detent, both directions (splash ->
+        // usage -> sessions -> splash). The first turn from sleep only wakes,
+        // like a first button press.
         if (board_caps().has_encoder) {
             int steps = input_hal_encoder_steps();
             if (steps != 0 && !idle_consume_wake_press()) {
-                const bool on_splash = ui_get_current_screen() == SCREEN_SPLASH;
-                const int  dir = steps > 0 ? 1 : -1;
-                for (int n = steps > 0 ? steps : -steps; n > 0; n--) {
-                    if (on_splash) dir > 0 ? splash_next() : splash_prev();
-                    else           brightness_step(dir);
-                }
+                const int dir = steps > 0 ? 1 : -1;
+                for (int n = steps > 0 ? steps : -steps; n > 0; n--) ui_step_screen(dir);
             }
         }
 
@@ -532,6 +679,8 @@ void loop() {
             }
         } else if (cur != SCREEN_SPLASH) {
             peek_ref_ms = now_ms;          // steht ohnehin auf den Zahlen
+        } else if (mascot_holds_splash()) {
+            peek_ref_ms = now_ms;          // Limit: der Clawd schlaeft, bleibt stehen
         } else if (now_ms - peek_ref_ms >= USAGE_PEEK_EVERY_MS) {
             peeking = true;
             peek_ref_ms = now_ms;
@@ -585,11 +734,19 @@ void loop() {
         msg_kind_t kind = parse_json(ble_get_data(), &usage, &session);
         if (kind == MSG_SESSION) {
             // Claude is stuck on a question: light the panel up so the alert
-            // is seen, not just drawn on a dark screen.
-            if (strcmp(session.state, "wait") == 0) idle_note_activity();
+            // is seen, not just drawn on a dark screen, and knock once when
+            // it starts waiting (not on every repeat of the same state). A
+            // permission prompt for the board counts from the moment it
+            // arrives — the "wait" notification only follows ~6 s later.
+            static bool was_waiting = false;
+            const bool waiting = strcmp(session.state, "wait") == 0 || session.pr_id;
+            if (waiting) idle_note_activity();
+            if (waiting && !was_waiting) sound_hal_play_attention();
+            was_waiting = waiting;
             ui_update_session(&session);
             ble_send_ack();
         } else if (kind == MSG_USAGE) {
+            last_usage_ms = millis();
             int g_before = usage_rate_group();
             bool session_reset = usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();
@@ -609,11 +766,14 @@ void loop() {
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
+            push_limit();
             ble_send_ack();
         } else {
             ble_send_nack();
         }
     }
+
+    mascot_tick();
 
     delay(5);
 }

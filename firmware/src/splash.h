@@ -9,9 +9,8 @@ void splash_init(lv_obj_t *parent);
 // Advance animation frame if hold time elapsed. Call from main loop.
 void splash_tick(void);
 
-// Cycle to the next / previous animation in the catalog.
+// Cycle to the next animation in the catalog.
 void splash_next(void);
-void splash_prev(void);
 
 // Show/hide the splash container.
 void splash_show(void);
@@ -35,6 +34,12 @@ void splash_pick_for_current_rate(void);
 // name actually changes, so a host repeating the same name every poll doesn't
 // fight the PWR button.
 void splash_set_anim(const char *name);
+
+// What Claude is doing, as a list of splash_anims[] names to rotate through
+// (see mascot.h). Wins over the usage-rate groups but not over splash_set_anim;
+// n == 0 hands back to the groups. A splash_next() pick stays up until the
+// list changes. Repeating the same list is a no-op.
+void splash_set_mood(const char* const* names, int n);
 
 // Aus dem LVGL-Flush-Callback zu rufen, sobald der letzte Streifen eines
 // Bilddurchlaufs draussen ist. Der Splash malt auf manchen Boards direkt auf

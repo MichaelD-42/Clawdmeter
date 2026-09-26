@@ -28,5 +28,6 @@ void sound_hal_tick(void)       { chime_tick(); }
 
 void sound_hal_play_pair_armed(void) { chime_play_cue(CHIME_CUE_PAIR_ARMED); }
 void sound_hal_play_paired(void)     { chime_play_cue(CHIME_CUE_PAIRED); }
+void sound_hal_play_attention(void)  { chime_play_cue(CHIME_CUE_ATTENTION); }
 
 #endif  // BOARD_HAS_SOUND

@@ -21,3 +21,7 @@ void sound_hal_play_reset(void);
 // notice (see that board's sound.cpp).
 void sound_hal_play_pair_armed(void);
 void sound_hal_play_paired(void);
+
+// A Claude Code session has started waiting on you (permission prompt or
+// question). Same posture: boards without a speaker ignore it.
+void sound_hal_play_attention(void);

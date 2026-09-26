@@ -244,7 +244,7 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 
 ## Session state and the needs-input alert
 
-The status line under the rings can show what Claude Code is doing ("Bash…", "Done", "Needs input") instead of the whimsical words. When Claude stops on a permission prompt or a question, the board wakes and a ring blinks around the edge of the panel, over whatever screen is up. It stops once the tool runs, or when you tap the screen.
+The status line under the rings can show what Claude Code is doing ("Build all seven board envs…", "Editing ui.cpp…", "Done", "Needs input") instead of the whimsical words. The step comes from the tool call itself: a command's description, the file being edited or read, an agent's task. When Claude stops on a permission prompt or a question, the board wakes and a ring blinks around the edge of the panel, over whatever screen is up. It stops once the tool runs, or when you tap the screen.
 
 This comes from Claude Code hooks. Each hook call hands its event to `daemon/clawdmeter_info.py`, which keeps one small file per session under `~/.cache/clawdmeter/sessions/`, and the daemon forwards any change within a second. Add this to `~/.claude/settings.json` on each machine, with the path pointing at your checkout (on Windows: `python %USERPROFILE%\Clawdmeter\daemon\clawdmeter_info.py hook`, with each backslash doubled inside the JSON):
 
@@ -256,12 +256,33 @@ This comes from Claude Code hooks. Each hook call hands its event to `daemon/cla
     "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "Notification":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }]
+    "StopFailure":      [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py permit", "timeout": 600 }] }]
   }
 }
 ```
 
-The hook always exits 0 with no output, so it never blocks or changes anything Claude does. With several sessions open, a session that is waiting on you wins; otherwise the most recently active one is shown. Without the hooks the status line just reads "Idle"; only an older daemon leaves the old status words up.
+The hook always exits 0 with no output, so it never blocks or changes anything Claude does. With several sessions open, a session that is waiting on you wins; otherwise the most recently active one is shown. Without the hooks the status line just reads "Idle"; only an older daemon leaves the old status words up. On boards with a speaker, a session that starts waiting on you also knocks twice.
+
+### Sessions screen, model and context
+
+A third screen is an overview of every open session: a dot, the name of the workspace it was started in and how full its context window is. Each running subagent sits one step in under its session, as type and objective ("Explore: Find the HAL headers"). The dot says the state — orange working, blue working through subagents, yellow and blinking waiting on you, red stopped on an API error (rate limit, overload, …), green done, grey idle. What a session is doing right now is left to the usage screen's status line, for the active session. Tap through it after the usage view; on the Knob, turn the ring (one screen per detent, both ways). The usage screen shows the model: inside the context ring on the round Knob, as a small line above the status line elsewhere.
+
+No hook reports the model or the context window, but the status line gets both. Pass its input on from your status line script:
+
+```bash
+input=$(cat)
+printf '%s' "$input" | python3 ~/Clawdmeter/daemon/clawdmeter_info.py status >/dev/null 2>&1 &
+```
+
+Without a status line of your own, point `statusLine` at `python3 ~/Clawdmeter/daemon/clawdmeter_info.py status` directly; it prints nothing, so the line stays empty. Without either, the screen still lists sessions and subagents, just without model and context.
+
+### Allow or deny from the board
+
+With the `PermissionRequest` hook above, a permission prompt also appears on the board: the project and tool, the command, path or URL in question (cut previews end in `...`), and **Deny** / **Allow**. The terminal dialog stays up at the same time; whichever you answer first wins, and answering in the terminal takes the prompt off the board. `approve = off` in the daemon config turns it off.
 
 ## Physical buttons
 
@@ -284,6 +305,7 @@ The device advertises a custom GATT service alongside the standard HID keyboard 
 | **Data Service**           | `4c41555a-4465-7669-6365-000000000001` |
 | RX Characteristic (write)  | `4c41555a-4465-7669-6365-000000000002` |
 | TX Characteristic (notify) | `4c41555a-4465-7669-6365-000000000003` |
+| REQ Characteristic (notify) | `4c41555a-4465-7669-6365-000000000004` |
 | **HID Service**            | `00001812-0000-1000-8000-00805f9b34fb` |
 
 JSON payload format (written to RX):
@@ -300,7 +322,9 @@ Session-state messages are written to the same characteristic, whenever the stat
 { "ev": 1, "p": "Clawdmeter", "st": "work", "tl": "Bash" }
 ```
 
-`p` = project (working-directory name), `st` = `work` / `wait` (needs input) / `done` / `idle`, `tl` = tool in use.
+`p` = project (the workspace root's name, `CLAUDE_PROJECT_DIR`), `st` = `work` / `wait` (needs input) / `done` / `idle`, `tl` = tool in use. `pr` = `[id, project, tool, preview]` while a permission prompt waits for the board.
+
+The board notifies on REQ: `01` = send the data again (it has none yet), `02 lo hi` / `03 lo hi` = Allow / Deny tapped for request `hi lo`. On Linux the daemon keeps a `bluetoothctl` running to hold that subscription open — BlueZ ends a notify session as soon as the client that started it exits.
 
 ## Recompiling fonts
 

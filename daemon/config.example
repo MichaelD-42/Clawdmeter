@@ -22,6 +22,11 @@
 #   off = silent (default)
 #   on  = chime through the board speaker (boards with audio: AMOLED-2.16 / 1.8)
 chime = off
+# Answer Claude Code's permission prompts on the board (needs the
+# PermissionRequest hook, see README). The terminal dialog stays up either way.
+#   on  = Allow / Deny on the board as well (default)
+#   off = terminal only
+approve = on
 # Show a clock on the Usage screen, in place of the "Usage" title.
 #   off  = no clock; the screen keeps showing "Usage" (default)
 #   auto = show the clock, auto-detecting 12h/24h from this machine's settings
