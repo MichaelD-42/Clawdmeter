@@ -39,7 +39,7 @@ struct SessionRow {
 
 struct AgentRow {
     char type[18];           // "Explore", "general-purpose", ...
-    char step[36];           // what it is doing, "" before its first tool call
+    char objective[36];      // what it was started for (the Agent call's description)
 };
 
 struct SessionInfo {

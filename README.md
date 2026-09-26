@@ -256,6 +256,7 @@ This comes from Claude Code hooks. Each hook call hands its event to `daemon/cla
     "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "Notification":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
+    "StopFailure":      [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
     "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "python3 ~/Clawdmeter/daemon/clawdmeter_info.py hook" }] }],
@@ -268,7 +269,7 @@ The hook always exits 0 with no output, so it never blocks or changes anything C
 
 ### Sessions screen, model and context
 
-A third screen lists every open session: a dot in the state colour, the project and how full its context window is, then a line saying what it is doing, with each running subagent's step indented under it. The heading is the model. Tap through it after the usage view; on the Knob, turn the ring (one screen per detent, both ways). The round Knob layout also draws the context window as a third, inner ring.
+A third screen is an overview of every open session: a dot, the name of the workspace it was started in and how full its context window is. Each running subagent sits one step in under its session, as type and objective ("Explore: Find the HAL headers"). The dot says the state — orange working, blue working through subagents, yellow and blinking waiting on you, red stopped on an API error (rate limit, overload, …), green done, grey idle. What a session is doing right now is left to the usage screen's status line, for the active session. Tap through it after the usage view; on the Knob, turn the ring (one screen per detent, both ways). The usage screen shows the model: inside the context ring on the round Knob, as a small line above the status line elsewhere.
 
 No hook reports the model or the context window, but the status line gets both. Pass its input on from your status line script:
 

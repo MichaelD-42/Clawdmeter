@@ -309,6 +309,7 @@ static void compute_layout(const BoardCaps& c) {
 #define COL_YELLOW    THEME_YELLOW
 #define COL_AMBER     THEME_AMBER
 #define COL_RED       THEME_RED
+#define COL_BLUE      THEME_BLUE
 #define COL_BAR_BG    THEME_BAR_BG
 
 // ---- Usage screen widgets (single non-splash view) ----
@@ -341,6 +342,7 @@ static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
 static lv_obj_t* lbl_anim;      // status line: connection state + session state
+static lv_obj_t* lbl_model;     // the active session's model, rectangular layouts
 static lv_obj_t* lbl_account;   // "Name · Plan", round layout only
 static lv_obj_t* ring_ctx;      // context window fill, round layout only (third ring)
 static lv_obj_t* lbl_ctx;       // its "Context NN%" caption
@@ -353,9 +355,12 @@ static lv_obj_t* lbl_ctx;       // its "Context NN%" caption
 // to a dozen characters on the round panel.
 #define SESS_ROWS_MAX 7
 static lv_obj_t* sessions_container;
-static lv_obj_t* lbl_sess_title;   // the model, "Sessions" until the status line reports one
+static lv_obj_t* lbl_sess_title;
 static lv_obj_t* sess_dot[SESS_ROWS_MAX];
 static lv_obj_t* sess_text[SESS_ROWS_MAX];
+static bool      sess_blink[SESS_ROWS_MAX];   // waiting: the dot blinks
+static lv_timer_t* sess_blink_timer = nullptr;
+static void sess_blink_cb(lv_timer_t* t);
 
 // Claude Code session state (ui_update_session). Until the first one arrives
 // — an older daemon, or no hooks installed — the whimsical words stay.
@@ -1008,6 +1013,18 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_size(lbl_anim, L.round ? 230 : L.content_w,
                     lv_font_get_line_height(L.anim_font));
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
+
+    // The model, small and dim, right above the status line. The round
+    // layout shows it inside the context ring instead (lbl_ctx).
+    if (!L.round) {
+        const lv_font_t* f = L.small_icons ? &font_styrene_12 : &font_styrene_14;
+        lbl_model = lv_label_create(usage_container);
+        lv_label_set_text(lbl_model, "");
+        lv_obj_set_style_text_font(lbl_model, f, 0);
+        lv_obj_set_style_text_color(lbl_model, COL_DIM, 0);
+        lv_obj_align(lbl_model, LV_ALIGN_BOTTOM_MID, 0,
+                     L.anim_y - lv_font_get_line_height(L.anim_font));
+    }
 }
 
 // ======== Sessions Screen ========
@@ -1053,23 +1070,43 @@ static void init_sessions_screen(lv_obj_t* scr) {
         lv_obj_add_flag(sess_dot[i], LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(sess_text[i], "");
     }
+    sess_blink_timer = lv_timer_create(sess_blink_cb, 500, nullptr);
+    lv_timer_pause(sess_blink_timer);
 }
 
 // One line. `dot`: show the state dot (session head line) in `col`. `indent`
 // in dot widths past the dot column: 0 for head lines and notes, 1 below.
-static void set_sess_row(int i, bool dot, int indent, const char* text, lv_color_t col) {
-    const int16_t d = L.sess_row_h / 4;
-    const int16_t x = L.sess_x + 2 * d + indent * 2 * d;
+static void set_sess_row(int i, bool dot, int indent, const char* text, lv_color_t col,
+                         bool blink = false) {
+    const int16_t d  = L.sess_row_h / 4;
+    const int16_t fh = lv_font_get_line_height(L.sess_font);
+    const int16_t y  = L.sess_top + i * L.sess_row_h;
+    const int16_t dx = L.sess_x + indent * 2 * d;   // subagents: one step in
+    const int16_t x  = dx + 2 * d;
+    sess_blink[i] = dot && blink;
     if (dot) {
         lv_obj_clear_flag(sess_dot[i], LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_bg_color(sess_dot[i], col, 0);
+        lv_obj_set_style_bg_opa(sess_dot[i], LV_OPA_COVER, 0);   // a blink may have left it off
+        lv_obj_set_pos(sess_dot[i], dx, y + (fh - d) / 2);
     } else {
         lv_obj_add_flag(sess_dot[i], LV_OBJ_FLAG_HIDDEN);
     }
-    lv_obj_set_pos(sess_text[i], x, L.sess_top + i * L.sess_row_h);
+    lv_obj_set_pos(sess_text[i], x, y);
     lv_obj_set_width(sess_text[i], L.sess_x + L.sess_w - x);
     lv_label_set_text(sess_text[i], text);
     lv_obj_set_style_text_color(sess_text[i], dot ? COL_TEXT : col, 0);
+}
+
+// Waiting dots blink, so the one state that needs you doesn't rely on colour.
+static void sess_blink_cb(lv_timer_t* t) {
+    (void)t;
+    static bool on = true;
+    on = !on;
+    for (int i = 0; i < L.sess_rows && i < SESS_ROWS_MAX; i++) {
+        if (!sess_blink[i]) continue;
+        lv_obj_set_style_bg_opa(sess_dot[i], on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
 }
 
 // ======== Public API ========
@@ -1232,9 +1269,10 @@ static void update_view_state(void) {
 // Words and colour for a session state. The status line and the Sessions
 // screen say the same thing.
 static const char* state_text(const char* state, const char* step, lv_color_t* color) {
-    if (strcmp(state, "work") == 0) { *color = COL_ACCENT; return step[0] ? step : "Working"; }
-    if (strcmp(state, "wait") == 0) { *color = COL_RED;    return "Needs input"; }
-    if (strcmp(state, "done") == 0) { *color = COL_GREEN;  return "Done"; }
+    if (strcmp(state, "work") == 0)  { *color = COL_ACCENT; return step[0] ? step : "Working"; }
+    if (strcmp(state, "wait") == 0)  { *color = COL_YELLOW; return "Needs input"; }
+    if (strcmp(state, "done") == 0)  { *color = COL_GREEN;  return "Done"; }
+    if (strcmp(state, "error") == 0) { *color = COL_RED;    return step[0] ? step : "Error"; }
     *color = COL_DIM;
     return "Idle";
 }
@@ -1333,6 +1371,8 @@ void ui_show_screen(screen_t screen) {
 
     current_screen = screen;
     apply_battery_visibility();
+    if (screen == SCREEN_SESSIONS) lv_timer_resume(sess_blink_timer);
+    else                           lv_timer_pause(sess_blink_timer);
 }
 
 void ui_step_screen(int dir) {
@@ -1577,40 +1617,34 @@ struct SessLine {
     int8_t     indent;
     uint8_t    items;       // sessions / agents this line stands for
     lv_color_t col;
+    bool       blink;       // waiting on you
     char       text[80];
 };
 
 static void update_sessions_screen(void) {
-    lv_label_set_text(lbl_sess_title, sess.model[0] ? sess.model : "Sessions");
-
-    static SessLine lines[SESSION_ROWS_MAX * 2 + AGENT_ROWS_MAX];
+    static SessLine lines[SESSION_ROWS_MAX + AGENT_ROWS_MAX];
     int n = 0;
     int more = sess.n_sessions > sess.n_rows ? sess.n_sessions - sess.n_rows : 0;
     for (int r = 0; r < sess.n_rows; r++) {
         const SessionRow& row = sess.rows[r];
         lv_color_t col;
-        const char* what = state_text(row.state, row.step, &col);
+        state_text(row.state, "", &col);
+        // Working through subagents reads as its own state.
+        if (!strcmp(row.state, "work") && row.n_agents > 0) col = COL_BLUE;
         const char* name = row.project[0] ? row.project : "Session";
 
         SessLine& head = lines[n++];
-        head = { true, 0, 1, col, "" };
+        head = { true, 0, 1, col, !strcmp(row.state, "wait"), "" };
         if (row.ctx >= 0) snprintf(head.text, sizeof(head.text), "%s #b0aea5 %d%%#", name, row.ctx);
         else              strlcpy(head.text, name, sizeof(head.text));
 
-        // Done / idle say enough through the dot; working and waiting get a
-        // line saying what.
-        if (!strcmp(row.state, "work") || !strcmp(row.state, "wait")) {
-            SessLine& step = lines[n++];
-            step = { false, 0, 0, col, "" };
-            strlcpy(step.text, what, sizeof(step.text));
-        }
         for (int a = 0; a < row.n_listed; a++) {
             const AgentRow& ag = sess.agents[row.first_agent + a];
             SessLine& line = lines[n++];
-            line = { false, 1, 1, COL_DIM, "" };
-            // What it is doing; its type only until its first tool call.
-            strlcpy(line.text, ag.step[0] ? ag.step : ag.type[0] ? ag.type : "Agent",
-                    sizeof(line.text));
+            line = { true, 1, 1, COL_BLUE, false, "" };
+            const char* type = ag.type[0] ? ag.type : "Agent";
+            if (ag.objective[0]) snprintf(line.text, sizeof(line.text), "%s: %s", type, ag.objective);
+            else            strlcpy(line.text, type, sizeof(line.text));
         }
         more += row.n_agents - row.n_listed;
     }
@@ -1620,7 +1654,8 @@ static void update_sessions_screen(void) {
     for (int k = shown; k < n; k++) more += lines[k].items;
 
     int i = 0;
-    for (; i < shown; i++) set_sess_row(i, lines[i].dot, lines[i].indent, lines[i].text, lines[i].col);
+    for (; i < shown; i++)
+        set_sess_row(i, lines[i].dot, lines[i].indent, lines[i].text, lines[i].col, lines[i].blink);
     if (sess.n_rows == 0) set_sess_row(i++, false, 0, "No sessions", COL_DIM);
     if (more > 0) {
         char buf[16];
@@ -1640,11 +1675,13 @@ void ui_update_session(const SessionInfo* s) {
     update_perm();
 
     update_sessions_screen();
+    // The model: inside the context ring on round panels, above the status
+    // line elsewhere.
     if (ring_ctx) {
         set_gauge(ring_ctx, sess.ctx < 0 ? 0 : sess.ctx, pct_color(sess.ctx));
-        if (sess.ctx >= 0) lv_label_set_text_fmt(lbl_ctx, "Context %d%%", sess.ctx);
-        else               lv_label_set_text(lbl_ctx, "");
+        lv_label_set_text(lbl_ctx, sess.model);
     }
+    if (lbl_model) lv_label_set_text(lbl_model, sess.model);
 }
 
 void ui_set_pairing_rejected(bool rejected) {

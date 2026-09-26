@@ -105,7 +105,7 @@ def test_tool_use_is_working_with_tool(tmp_path):
         "st": "work",
         "tl": "Running a command",
         "sn": 1,
-        "ss": [["Clawdmeter", "work", "Running a command", -1, [], 0]],
+        "ss": [["Clawdmeter", "work", "", -1, [], 0]],
     }
 
 
@@ -234,7 +234,7 @@ def test_subagent_tool_does_not_touch_main_session(tmp_path):
     _agent(tmp_path, 102, "PreToolUse", "a1", tool_name="Grep")
     s = ci.session_summary(now=103, state_dir=tmp_path)
     assert s["tl"] == "Delegating"
-    assert s["ss"][0][4] == [["Explore", "Searching"]]
+    assert s["ss"][0][4] == [["Explore", ""]]  # the objective, not its steps
 
 
 def test_parallel_subagents_listed_oldest_first(tmp_path):
@@ -243,7 +243,7 @@ def test_parallel_subagents_listed_oldest_first(tmp_path):
     _agent(tmp_path, 102, "SubagentStart", "a2", atype="plugin:x:reviewer")
     _agent(tmp_path, 103, "PostToolUse", "a1", tool_name="Read")
     s = ci.session_summary(now=104, state_dir=tmp_path)
-    assert s["ss"][0][4] == [["Explore", "Reading"], ["reviewer", ""]]
+    assert s["ss"][0][4] == [["Explore", ""], ["reviewer", ""]]
 
 
 def test_silent_subagent_is_dropped(tmp_path):
@@ -547,3 +547,90 @@ def test_permission_request_names_the_workspace_root(tmp_path, monkeypatch):
 
     ci.request_permission(ev, state_dir=tmp_path, wait=wait)
     assert seen["pr"][1] == "Clawdmeter"
+
+
+# ---------------------------------------------------------------------------
+# subagent objectives, error state, overview rows
+# ---------------------------------------------------------------------------
+
+
+def _spawn(d, now, desc, atype="Explore", sid="s1"):
+    # The parent's Agent call, before the subagent exists.
+    _hook(d, now, "PreToolUse", sid=sid, tool_name="Agent",
+          tool_input={"description": desc, "prompt": "...", "subagent_type": atype})
+
+
+def _launched(d, now, desc, aid, atype="Explore", sid="s1"):
+    # A background agent: the parent's PostToolUse names the new agent's id.
+    _hook(d, now, "PostToolUse", sid=sid, tool_name="Agent",
+          tool_input={"description": desc, "prompt": "...", "subagent_type": atype},
+          tool_response={"isAsync": True, "agentId": aid, "description": desc})
+
+
+def _agents_of(d, now):
+    return ci.session_summary(now=now, state_dir=d)["ss"][0][4]
+
+
+def test_objective_from_the_agent_call(tmp_path):
+    _spawn(tmp_path, 100, "Scan the boards")
+    _agent(tmp_path, 101, "SubagentStart", "a1")
+    assert _agents_of(tmp_path, 102) == [["Explore", "Scan the boards"]]
+
+
+def test_parallel_agents_of_different_types_get_their_own(tmp_path):
+    _spawn(tmp_path, 100, "Find the HAL", atype="Explore")
+    _spawn(tmp_path, 100, "Design the fix", atype="Plan")
+    _agent(tmp_path, 101, "SubagentStart", "a2", atype="Plan")
+    _agent(tmp_path, 102, "SubagentStart", "a1", atype="Explore")
+    assert _agents_of(tmp_path, 103) == [["Plan", "Design the fix"], ["Explore", "Find the HAL"]]
+
+
+def test_same_type_agents_take_objectives_oldest_first(tmp_path):
+    _spawn(tmp_path, 100, "First")
+    _spawn(tmp_path, 101, "Second")
+    _agent(tmp_path, 102, "SubagentStart", "a1")
+    _agent(tmp_path, 103, "SubagentStart", "a2")
+    assert _agents_of(tmp_path, 104) == [["Explore", "First"], ["Explore", "Second"]]
+
+
+def test_background_agent_is_linked_by_its_id(tmp_path):
+    # No SubagentStart needed: the launch result names the agent, and its own
+    # tool calls carry that id.
+    _spawn(tmp_path, 100, "First")
+    _spawn(tmp_path, 100, "Second")
+    _launched(tmp_path, 101, "Second", "x2")
+    _agent(tmp_path, 102, "PreToolUse", "x2", tool_name="Bash")
+    assert _agents_of(tmp_path, 103) == [["Explore", "Second"]]
+    _launched(tmp_path, 104, "First", "x1")
+    assert _agents_of(tmp_path, 105) == [["Explore", "Second"], ["Explore", "First"]]
+    assert not (tmp_path / "s1.spawn").exists() or ci._read_list(tmp_path / "s1.spawn") == []
+
+
+def test_stale_agent_calls_are_forgotten(tmp_path):
+    _spawn(tmp_path, 100, "Long ago")
+    now = 100 + ci.AGENT_STALE_S + 1
+    _hook(tmp_path, now, "PreToolUse", tool_name="Bash")
+    _agent(tmp_path, now, "SubagentStart", "a1")
+    assert _agents_of(tmp_path, now + 1) == [["Explore", ""]]
+
+
+def test_session_end_removes_pending_agent_calls(tmp_path):
+    _spawn(tmp_path, 100, "Pending")
+    _hook(tmp_path, 101, "SessionEnd")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_api_error_marks_the_session(tmp_path):
+    _hook(tmp_path, 100, "PreToolUse", tool_name="Bash")
+    _hook(tmp_path, 101, "StopFailure", error_type="rate_limit")
+    s = ci.session_summary(now=102, state_dir=tmp_path)
+    assert (s["st"], s["tl"]) == ("error", "Error: rate_limit")
+    _hook(tmp_path, 103, "UserPromptSubmit")
+    assert ci.session_summary(now=104, state_dir=tmp_path)["st"] == "work"
+
+
+def test_rows_leave_the_step_to_the_usage_screen(tmp_path):
+    _hook(tmp_path, 100, "PreToolUse", tool_name="Edit", tool_input={"file_path": "/a/ui.cpp"})
+    s = ci.session_summary(now=101, state_dir=tmp_path)
+    assert s["tl"] == "Editing ui.cpp"
+    assert s["ss"][0][2] == ""

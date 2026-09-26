@@ -138,7 +138,7 @@ static msg_kind_t parse_json(const char* json, UsageData* out, SessionInfo* sess
         sess->n_sessions = doc["sn"] | 0;
         sess->n_rows = 0;
         sess->n_agent_rows = 0;
-        // "ss": [[project, state, step, ctx, [[type, step], ...], n_agents], ...]
+        // "ss": [[project, state, step, ctx, [[type, objective], ...], n_agents], ...]
         for (JsonArray r : doc["ss"].as<JsonArray>()) {
             if (sess->n_rows >= SESSION_ROWS_MAX) break;
             SessionRow& row = sess->rows[sess->n_rows++];
@@ -151,7 +151,7 @@ static msg_kind_t parse_json(const char* json, UsageData* out, SessionInfo* sess
                 if (sess->n_agent_rows >= AGENT_ROWS_MAX) break;
                 AgentRow& ag = sess->agents[sess->n_agent_rows++];
                 strlcpy(ag.type, a[0] | "", sizeof(ag.type));
-                strlcpy(ag.step, a[1] | "", sizeof(ag.step));
+                strlcpy(ag.objective, a[1] | "", sizeof(ag.objective));
             }
             row.n_listed = sess->n_agent_rows - row.first_agent;
             row.n_agents = r[5] | row.n_listed;
@@ -229,6 +229,37 @@ static void send_screenshot() {
 #endif
 }
 
+static void show_session_demo() {
+    static SessionInfo demo;
+    demo = {};
+    strlcpy(demo.project, "Clawdmeter", sizeof(demo.project));
+    strlcpy(demo.state, "work", sizeof(demo.state));
+    strlcpy(demo.step, "Editing ui.cpp", sizeof(demo.step));
+    strlcpy(demo.model, "Opus 5.5", sizeof(demo.model));
+    demo.ctx = 42;
+    struct { const char* p; const char* st; int ctx; int agents; } rows[] = {
+        { "Clawdmeter", "work", 42, 2 }, { "homelab", "wait", 67, 0 },
+        { "signum-bot", "error", 12, 0 }, { "blog", "done", 88, 0 },
+    };
+    const char* agents[][2] = { { "Explore", "Find the HAL headers" }, { "Plan", "Design the overlay" } };
+    demo.n_sessions = 4;
+    for (auto& r : rows) {
+        SessionRow& row = demo.rows[demo.n_rows++];
+        strlcpy(row.project, r.p, sizeof(row.project));
+        strlcpy(row.state, r.st, sizeof(row.state));
+        row.ctx = r.ctx;
+        row.first_agent = demo.n_agent_rows;
+        for (int a = 0; a < r.agents; a++) {
+            AgentRow& ag = demo.agents[demo.n_agent_rows++];
+            strlcpy(ag.type, agents[a][0], sizeof(ag.type));
+            strlcpy(ag.objective, agents[a][1], sizeof(ag.objective));
+        }
+        row.n_listed = row.n_agents = r.agents;
+    }
+    ui_update_session(&demo);
+    ui_show_screen(SCREEN_SESSIONS);
+}
+
 static void check_serial_cmd() {
     while (Serial.available()) {
         char c = Serial.read();
@@ -243,6 +274,10 @@ static void check_serial_cmd() {
             else if (strcmp(cmd_buf, "uncharge") == 0) charge_anim_play(false);
             // Fake a permission prompt for screenshots: `perm <preview>` shows
             // the approval overlay (id 0xBEEF), `perm off` takes it away.
+            // Fill the sessions screen with made-up sessions for screenshots;
+            // `sessdemo off` puts the real ones back.
+            else if (strcmp(cmd_buf, "sessdemo") == 0)     show_session_demo();
+            else if (strcmp(cmd_buf, "sessdemo off") == 0) ui_update_session(&session);
             else if (strncmp(cmd_buf, "perm ", 5) == 0) {
                 const bool off = strcmp(cmd_buf + 5, "off") == 0;
                 session.pr_id = off ? 0 : 0xBEEF;

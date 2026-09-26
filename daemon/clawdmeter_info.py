@@ -203,13 +203,92 @@ def _read(path: Path) -> dict | None:
     return rec if isinstance(rec, dict) else None
 
 
+def _read_list(path: Path) -> list:
+    try:
+        items = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return items if isinstance(items, list) else []
+
+
 def _remove_session(path: Path) -> None:
-    # The session file plus its subagent files (<sid>.<agent>.agent) and its
-    # status line record (<sid>.ctx).
+    # The session file plus its subagent files (<sid>.<agent>.agent), its
+    # status line record (<sid>.ctx) and its pending agent calls (<sid>.spawn).
     sid = path.stem
     path.unlink(missing_ok=True)
-    for f in [*path.parent.glob(f"{sid}.*.agent"), path.with_suffix(".ctx")]:
+    for f in [
+        *path.parent.glob(f"{sid}.*.agent"),
+        path.with_suffix(".ctx"),
+        path.with_suffix(".spawn"),
+    ]:
         f.unlink(missing_ok=True)
+
+
+# ---- Subagent objectives --------------------------------------------------
+# What a subagent is for is the description of the Agent call that started
+# it, but SubagentStart does not say which call that was. A background agent
+# is linked exactly: the call's PostToolUse returns its agentId. A foreground
+# one takes the oldest pending call of its type from <sid>.spawn.
+
+
+def _agent_type(value) -> str:
+    return str(value or "").split(":")[-1][:AGENT_MAX]
+
+
+def _spawn_entry(event: dict) -> tuple:
+    inp = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    return (
+        _agent_type(inp.get("subagent_type") or "general-purpose"),
+        _ascii(inp.get("description"))[:STEP_MAX].rstrip(),
+    )
+
+
+def _note_spawn(sid: str, event: dict, now, state_dir: Path) -> None:
+    path = state_dir / f"{sid}.spawn"
+    items = [i for i in _read_list(path) if now - i.get("ts", 0) <= AGENT_STALE_S]
+    atype, desc = _spawn_entry(event)
+    items.append({"t": atype, "d": desc, "ts": now})
+    _write_list(path, items)
+
+
+def _take_spawn(sid: str, now, state_dir: Path, atype: str, desc=None) -> str:
+    # Remove and return the oldest pending call of this type (and description,
+    # if known); without one of the type, the oldest of any type.
+    path = state_dir / f"{sid}.spawn"
+    items = [i for i in _read_list(path) if now - i.get("ts", 0) <= AGENT_STALE_S]
+    pick = next(
+        (i for i in items if i.get("t") == atype and desc in (None, i.get("d"))), None
+    )
+    if pick is None and desc is None and items:
+        pick = items[0]
+    if pick is not None:
+        items.remove(pick)
+    _write_list(path, items)
+    return pick.get("d", "") if pick else (desc or "")
+
+
+def _write_list(path: Path, items: list) -> None:
+    if items:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(items), encoding="utf-8")
+        os.replace(tmp, path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _link_agent(sid: str, event: dict, now, state_dir: Path) -> None:
+    # PostToolUse of a background Agent call: its result names the new agent.
+    resp = event.get("tool_response")
+    aid = _clean(resp.get("agentId")) if isinstance(resp, dict) else ""
+    if not aid:
+        return
+    atype, desc = _spawn_entry(event)
+    path = state_dir / f"{sid}.{aid}.agent"
+    rec = _read(path) or {"t": atype, "tl": "", "t0": now}
+    rec["d"] = _take_spawn(sid, now, state_dir, atype, desc)
+    rec["ts"] = now
+    _write(path, rec)
 
 
 def _record_agent(event: dict, kind, sid: str, now, state_dir: Path) -> None:
@@ -225,11 +304,10 @@ def _record_agent(event: dict, kind, sid: str, now, state_dir: Path) -> None:
     prev = _read(path)
     if prev is None and kind != "SubagentStart":
         return  # a tool call after the stop, or from an agent we never saw start
-    rec = prev or {
-        "t": str(event.get("agent_type") or "").split(":")[-1][:AGENT_MAX],
-        "tl": "",
-        "t0": now,
-    }
+    if prev is None:
+        atype = _agent_type(event.get("agent_type"))
+        prev = {"t": atype, "tl": "", "t0": now, "d": _take_spawn(sid, now, state_dir, atype)}
+    rec = prev
     if kind in ("PreToolUse", "PostToolUse"):
         rec["tl"] = step_text(event.get("tool_name"), event.get("tool_input"))
     rec["ts"] = now
@@ -255,6 +333,11 @@ def record_hook(event: dict, now=None, state_dir: Path = STATE_DIR) -> None:
     except (OSError, ValueError):
         prev = {}
     tool = prev.get("tl", "")
+    if event.get("tool_name") in ("Agent", "Task"):
+        if kind == "PreToolUse":
+            _note_spawn(path.stem, event, now, state_dir)
+        else:
+            _link_agent(path.stem, event, now, state_dir)
     if kind == "UserPromptSubmit":
         state, tool = "work", ""
     elif kind in ("PreToolUse", "PostToolUse"):
@@ -269,6 +352,10 @@ def record_hook(event: dict, now=None, state_dir: Path = STATE_DIR) -> None:
             return
     elif kind == "Stop":
         state, tool = "done", ""
+    elif kind == "StopFailure":
+        # The turn ended on an API error (rate limit, overload, auth, ...).
+        state = "error"
+        tool = _ascii(f"Error: {event.get('error_type') or 'unknown'}")[:STEP_MAX]
     else:
         return
     _write(path, {"p": _project(event), "st": state, "tl": tool, "ts": now})
@@ -299,7 +386,7 @@ def _agents(sid: str, now, state_dir: Path) -> list:
             continue
         agents.append(rec)
     agents.sort(key=lambda r: r.get("t0", 0))
-    return [[a.get("t", ""), a.get("tl", "")] for a in agents]
+    return [[a.get("t", ""), a.get("d", "")] for a in agents]
 
 
 def _fit(msg: dict) -> dict:
@@ -347,7 +434,7 @@ def session_summary(now=None, state_dir: Path = STATE_DIR) -> dict:
             [
                 rec.get("p", ""),
                 rec.get("st", "idle"),
-                rec.get("tl", ""),
+                "",  # the step is the usage screen's business (top-level tl)
                 ctx.get("cx", -1),
                 shown,
                 len(agents),
